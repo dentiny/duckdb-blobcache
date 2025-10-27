@@ -7,18 +7,28 @@ namespace duckdb {
 // BlobFilesystemWrapper Implementation
 //===----------------------------------------------------------------------===//
 
-unique_ptr<FileHandle> BlobFilesystemWrapper::OpenFile(const string &path, FileOpenFlags flags,
-                                                       optional_ptr<FileOpener> opener) {
-	auto wrapped_handle = wrapped_fs->OpenFile(path, flags, opener);
-
-	if (cache->state.blobcache_initialized && flags.OpenForReading() && !flags.OpenForWriting()) {
-		if (cache->ShouldCacheFile(path, opener)) {
-			string key = cache->state.GenCacheKey(path);
-			return make_uniq<BlobFileHandle>(*this, path, std::move(wrapped_handle), key, cache);
+unique_ptr<FileHandle> BlobFilesystemWrapper::OpenFileExtended(const OpenFileInfo &info, FileOpenFlags flags,
+                                        				       optional_ptr<FileOpener> opener)  {
+	auto wrapped_handle = wrapped_fs->OpenFile(info.path, flags, opener);
+	if (!wrapped_handle || (!IsFakeS3(info.path) && wrapped_fs->OnDiskFile(*wrapped_handle))) {
+		return wrapped_handle; // Never cache file:// URLs as they are already local
+	}
+	auto lakecache_file = IsFakeS3(info.path) || cache->CacheUnsafely(info.path, opener);
+	if (!lakecache_file && info.extended_info) {
+		// parquet_scan specialized for a Lake (duck,ice,delta) switch off validation, this allows for safe caching
+		const auto &open_options = info.extended_info->options;
+		const auto validate_entry = open_options.find("validate_external_file_cache");
+		if (validate_entry != open_options.end()) {
+			lakecache_file |= !validate_entry->second.GetValue<bool>(); // do not validate => free pass for caching
 		}
 	}
-	return wrapped_handle;
+	if (!lakecache_file) {
+		return wrapped_handle; // don't cache, return a normal handle
+	}
+	auto key = cache->state.GenCacheKey(info.path);
+	return make_uniq<BlobFileHandle>(*this, info.path, std::move(wrapped_handle), key, cache);
 }
+
 
 static idx_t ReadChunk(duckdb::FileSystem &wrapped_fs, BlobFileHandle &handle, char *buf, idx_t location, idx_t len) {
 	// NOTE: ReadFromCache() can return cached_bytes == 0 but adjust max_nr_bytes downwards to align with a cached range
@@ -45,7 +55,7 @@ static idx_t ReadChunk(duckdb::FileSystem &wrapped_fs, BlobFileHandle &handle, c
 
 		handle.cache->InsertCache(handle.key, handle.uri, location + nr_cached, nr_read, buf + nr_cached);
 
-		if (nr_read && StringUtil::StartsWith(handle.uri, "fakes3://")) {
+		if (nr_read && BlobFilesystemWrapper::IsFakeS3(handle.uri)) {
 			std::this_thread::sleep_for(std::chrono::milliseconds(EstimateS3(nr_read))); // simulate S3 latency
 		}
 	}
@@ -147,6 +157,7 @@ shared_ptr<BlobCache> GetOrCreateBlobCache(DatabaseInstance &instance) {
 
 void WrapExistingFilesystems(DatabaseInstance &instance) {
 	auto &db_fs = FileSystem::GetFileSystem(instance);
+	bool fake_s3_seen = false;
 	DUCKDB_LOG_DEBUG(instance, "[BlobCache] Filesystem type: %s", db_fs.GetName().c_str());
 
 	// Get VirtualFileSystem
@@ -178,6 +189,7 @@ void WrapExistingFilesystems(DatabaseInstance &instance) {
 
 		// Skip if already wrapped (starts with "BlobCache:")
 		if (name.find("BlobCache:") == 0) {
+			fake_s3_seen |=  (name == "BlobCache:fake_s3");
 			DUCKDB_LOG_DEBUG(instance, "[BlobCache] Skipping already wrapped subsystem: '%s'", name.c_str());
 			continue;
 		}
@@ -194,12 +206,12 @@ void WrapExistingFilesystems(DatabaseInstance &instance) {
 			DUCKDB_LOG_ERROR(instance, "[BlobCache] Failed to extract '%s' - subsystem not wrapped", name.c_str());
 		}
 	}
-
-	// Register fakes3:// filesystem for testing purposes - wrapped with caching
-	DUCKDB_LOG_DEBUG(instance, "[BlobCache] Registering fakes3:// filesystem for testing");
-	auto fakes3_fs = make_uniq<FakeS3FileSystem>();
-	auto wrapped_fakes3_fs = make_uniq<BlobFilesystemWrapper>(std::move(fakes3_fs), shared_cache);
-	vfs->RegisterSubSystem(std::move(wrapped_fakes3_fs));
+	if (!fake_s3_seen) { // Register fakes3:// filesystem for testing purposes - wrapped with caching
+		DUCKDB_LOG_DEBUG(instance, "[BlobCache] Registering fake_s3:// filesystem for testing");
+		auto fake_s3_fs = make_uniq<FakeS3FileSystem>();
+		auto wrapped_fake_s3_fs = make_uniq<BlobFilesystemWrapper>(std::move(fake_s3_fs), shared_cache);
+		vfs->RegisterSubSystem(std::move(wrapped_fake_s3_fs));
+	}
 
 	// Log final subsystem list
 	auto final_subsystems = vfs->ListSubSystems();

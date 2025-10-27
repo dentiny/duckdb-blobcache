@@ -338,7 +338,7 @@ struct BlobCache {
 
 	// Configuration and caching policy
 	void ConfigureCache(const string &directory, idx_t max_size_bytes, idx_t writer_threads);
-	bool ShouldCacheFile(const string &uri, optional_ptr<FileOpener> opener = nullptr) const;
+	bool CacheUnsafely(const string &uri, optional_ptr<FileOpener> opener = nullptr) const;
 	void UpdateRegexPatterns(const string &regex_patterns_str);
 
 	// helper that delegates to BlobCacheMap on both smaller and larger

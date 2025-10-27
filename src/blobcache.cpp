@@ -1,4 +1,5 @@
 #include "blobcache.hpp"
+#include "duckdb/common/opener_file_system.hpp"
 
 namespace duckdb {
 
@@ -649,13 +650,16 @@ void BlobCacheState::EnsureDirectoryExists(const string &key, BlobCacheType type
 		return;
 	}
 	auto dir = blobcache_dir + key.substr(0, 3);
-	if (type == BlobCacheType::LARGE_RANGE) {
-		dir += path_sep + key.substr(3, 2);
-	}
 	try {
 		auto &fs = FileSystem::GetFileSystem(*db_instance);
 		if (!fs.DirectoryExists(dir)) {
 			fs.CreateDirectory(dir);
+		}
+		if (type == BlobCacheType::LARGE_RANGE) {
+			dir += path_sep + key.substr(3, 2);
+			if (!fs.DirectoryExists(dir)) {
+				fs.CreateDirectory(dir);
+			}
 		}
 		subdir_created.set(idx);
 	} catch (const std::exception &e) {
@@ -772,26 +776,14 @@ void BlobCache::UpdateRegexPatterns(const string &regex_patterns_str) {
 	state.LogDebug("UpdateRegexPatterns: now using " + std::to_string(cached_regexps.size()) + " regex patterns");
 }
 
-bool BlobCache::ShouldCacheFile(const string &uri, optional_ptr<FileOpener> opener) const {
+bool BlobCache::CacheUnsafely(const string &uri, optional_ptr<FileOpener> opener) const {
 	std::lock_guard<std::mutex> lock(regex_mutex);
-	if (StringUtil::StartsWith(StringUtil::Lower(uri), "file://")) {
-		return false; // Never cache file:// URLs as they are already local
-	}
-	if (StringUtil::StartsWith(StringUtil::Lower(uri), "fakes3://")) {
-		return true; // Always cache fakes3:// URLs for testing
-	}
-	if (!cached_regexps.empty()) {
-		// Aggressive mode: use cached compiled regex patterns
+	if (!cached_regexps.empty()) { // empty is default!
+		// the regexps allow unsafe caching (without worrying about etags/modified times): blindly cache
 		for (const auto &compiled_pattern : cached_regexps) {
 			if (std::regex_search(uri, compiled_pattern)) {
 				return true;
 			}
-		}
-	} else if (StringUtil::EndsWith(StringUtil::Lower(uri), ".parquet") && opener) {
-		Value parquet_cache_value; // Conservative mode: only cache .parquet files if parquet_metadata_cache=true
-		auto parquet_result = FileOpener::TryGetCurrentSetting(opener, "parquet_metadata_cache", parquet_cache_value);
-		if (parquet_result) {
-			return BooleanValue::Get(parquet_cache_value);
 		}
 	}
 	return false;

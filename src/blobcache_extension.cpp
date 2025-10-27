@@ -392,15 +392,8 @@ public:
 void BlobcacheExtension::Load(ExtensionLoader &loader) {
 	auto &instance = loader.GetDatabaseInstance();
 	DUCKDB_LOG_DEBUG(instance, "[BlobCache] BlobCache extension loaded!");
-
 	// Get configuration for callbacks
 	auto &config = DBConfig::GetConfig(instance);
-
-	// Disable global external file cache to avoid double-caching with our disk cache
-	// Our CachingFileSystem will still work (allocates BufferHandle but doesn't cache ranges)
-	config.options.enable_external_file_cache = false;
-	ExternalFileCache::Get(instance).SetEnabled(false);
-	DUCKDB_LOG_DEBUG(instance, "[BlobCache] Disabled global external file cache");
 
 	// Register table functions
 	DUCKDB_LOG_DEBUG(instance, "[BlobCache] Registering table functions...");

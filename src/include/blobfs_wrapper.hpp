@@ -73,10 +73,20 @@ public:
 	}
 	virtual ~BlobFilesystemWrapper() = default;
 
+	static bool IsFakeS3(const string &path) {
+		return StringUtil::Lower(path.substr(0,10)) == "fake_s3://";
+	}
+protected:
+	bool SupportsOpenFileExtended() const override {
+		return true;
+	}
+	unique_ptr<FileHandle> OpenFileExtended(const OpenFileInfo &path, FileOpenFlags flags,
+	                                        optional_ptr<FileOpener> opener) override;
+public:
 	// FileSystem interface implementation
-	unique_ptr<FileHandle> OpenFile(const string &path, FileOpenFlags flags,
-	                                optional_ptr<FileOpener> opener = nullptr) override;
-
+	unique_ptr<FileHandle> OpenFile(const string &path, FileOpenFlags flags, optional_ptr<FileOpener> opener) override {
+		return OpenFileExtended(OpenFileInfo(path), flags, opener);
+	}
 	// read ops are our caching opportunity -- worked out in cpp file
 	void Read(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) override;
 	int64_t Read(FileHandle &handle, void *buffer, int64_t nr_bytes) override;
@@ -219,56 +229,55 @@ private:
 
 class FakeS3FileSystem : public LocalFileSystem {
 public:
-	FakeS3FileSystem() : LocalFileSystem() {
-	}
+	FakeS3FileSystem() : LocalFileSystem() { }
 	~FakeS3FileSystem() override = default;
 
-	// Override to claim we can handle fakes3:// URLs
 	bool CanHandleFile(const string &fpath) override {
-		return StringUtil::StartsWith(StringUtil::Lower(fpath), "fakes3://");
+		return BlobFilesystemWrapper::IsFakeS3(fpath); // Override to claim we can handle fake_s3:// URLs
 	}
-
-	// Override GetName to identify as fakes3:// filesystem
+	bool OnDiskFile(FileHandle &handle) override {
+		return false; // the point of this fake fs is to pretend it is S3, ie a non-disk fs
+	}
 	string GetName() const override {
-		return "fakes3";
+		return "fake_s3"; // Override GetName to identify as fake_s3:// filesystem
 	}
-
-	// Override FileExists to handle fakes3:// URLs
-	bool FileExists(const string &uri, optional_ptr<FileOpener> opener = nullptr) override {
-		string actual_path = StripFakeS3Prefix(uri);
-		return LocalFileSystem::FileExists(actual_path, opener);
-	}
-
-	// Override OpenFile to strip fakes3:// prefix
+	// Override all methods manipulating paths to strip/add the fake_s3:// path prefix
 	unique_ptr<FileHandle> OpenFile(const string &uri, FileOpenFlags flags,
 	                                optional_ptr<FileOpener> opener = nullptr) override {
-		// Strip fakes3:// prefix to get actual local path
-		string file_path = StripFakeS3Prefix(uri);
-
-		// Call parent implementation with actual path
-		return LocalFileSystem::OpenFile(file_path, flags, opener);
+		return LocalFileSystem::OpenFile(Stripfake_s3Prefix(uri), flags, opener);
 	}
-
-	// Override Glob to strip prefix for search, then re-add to results
+	bool FileExists(const string &uri, optional_ptr<FileOpener> opener = nullptr) override {
+		return LocalFileSystem::FileExists(Stripfake_s3Prefix(uri), opener);
+	}
+	bool DirectoryExists(const string &directory, optional_ptr<FileOpener> opener = nullptr) override {
+		return LocalFileSystem::DirectoryExists(Stripfake_s3Prefix(directory), opener);
+	}
+	void CreateDirectory(const string &directory, optional_ptr<FileOpener> opener = nullptr) override {
+		LocalFileSystem::CreateDirectory(Stripfake_s3Prefix(directory), opener);
+	}
+	void CreateDirectoriesRecursive(const string &path, optional_ptr<FileOpener> opener = nullptr) override {
+		LocalFileSystem::CreateDirectoriesRecursive(Stripfake_s3Prefix(path), opener);
+	}
+	void RemoveDirectory(const string &directory, optional_ptr<FileOpener> opener = nullptr) override {
+		LocalFileSystem::RemoveDirectory(Stripfake_s3Prefix(directory), opener);
+	}
+	bool ListFiles(const string &directory, const std::function<void(const string &, bool)> &callback,
+	               FileOpener *opener = nullptr) override {
+		auto wrapped_callback = [&callback](const string &path, bool is_directory) {
+			callback("fake_s3://" + path, is_directory); // Pretend the paths start with fake_s3://
+		};
+		return LocalFileSystem::ListFiles(Stripfake_s3Prefix(directory), wrapped_callback, opener);
+	}
 	vector<OpenFileInfo> Glob(const string &uri, FileOpener *opener = nullptr) override {
-		string file_path = StripFakeS3Prefix(uri);
-		auto results = LocalFileSystem::Glob(file_path, opener);
-
-		// Re-add fakes3:// prefix to all returned paths so subsequent reads use fakes3 filesystem
+		auto results = LocalFileSystem::Glob(Stripfake_s3Prefix(uri), opener);
 		for (auto &info : results) {
-			info.path = "fakes3://" + info.path;
+			info.path = "fake_s3://" + info.path; // Pretend the paths start with fake_s3://
 		}
-
 		return results;
 	}
-
 private:
-	// Helper method to strip fakes3:// prefix
-	string StripFakeS3Prefix(const string &uri) {
-		if (StringUtil::StartsWith(StringUtil::Lower(uri), "fakes3://")) {
-			return uri.substr(9);
-		}
-		return uri;
+	string Stripfake_s3Prefix(const string &uri) {
+		return BlobFilesystemWrapper::IsFakeS3(uri) ? uri.substr(10) : uri;
 	}
 };
 

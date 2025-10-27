@@ -2,11 +2,10 @@
 # description: test blobcache extension
 # group: [sql]
 
-require blobcache
-
 require parquet
 
-# connection main
+require blobcache
+
 statement ok
 install tpch
 
@@ -23,7 +22,7 @@ statement ok
 call enable_logging(level='error');
 
 statement ok
-select max(l_comment) from read_parquet('fakes3://lineitem.parquet');
+select max(l_comment) from read_parquet('fake_s3://lineitem.parquet');
 
 query I
 select message from duckdb_logs;
@@ -33,39 +32,34 @@ query III
 select cache_type, count(*), sum(usage_count) from blobcache_stats() group by all order by all;
 ----
 large	16	0
-small	16	1
 
 statement ok
-select max(l_comment) from read_parquet('fakes3://lineitem.parquet');
+select max(l_comment) from read_parquet('fake_s3://lineitem.parquet');
 
 query III
 select cache_type, count(*), sum(usage_count) from blobcache_stats() group by all order by all;
 ----
 large	16	16
-small	16	18
 
 # Verify that bytes_from_mem is now > 0 (memory cache hits on second read)
 query II
 select cache_type, sum(bytes_from_mem) > 0 from blobcache_stats() group by all order by all;
 ----
 large	1
-small	1
 
 statement ok
-select max(l_comment) from read_parquet('fakes3://lineitem.parquet');
+select max(l_comment) from read_parquet('fake_s3://lineitem.parquet');
 
 query III
 select cache_type, count(*), sum(usage_count) from blobcache_stats() group by all order by all;
 ----
 large	16	32
-small	16	35
 
 # Verify bytes_from_mem still > 0 after third read (with external file cache disabled)
 query II
 select cache_type, sum(bytes_from_mem) > 0 from blobcache_stats() group by all order by all;
 ----
 large	1
-small	1
 
 statement ok
 from blobcache_config('.blobcache2/', 1024, 255);
@@ -83,37 +77,32 @@ select * replace(substr(cache_path,0,12) as cache_path) from blobcache_config();
 
 # Run a query to populate the new cache
 statement ok
-select max(l_comment) from read_parquet('fakes3://lineitem.parquet');
+select max(l_comment) from read_parquet('fake_s3://lineitem.parquet');
 
 # Verify new cache is populated
 query I
 select count(*) from blobcache_stats();
 ----
-32
+16
 
-# Test that Parquet reads bypass DuckDB's ExternalFileCache
+# take ducklake for a spin
 statement ok
-from blobcache_config('.blobcache3/', 512, 1);
+install ducklake
 
-# Confirm global external file cache is disabled
-query I
-select current_setting('enable_external_file_cache');
-----
-0
-
-# Run a query through our cache
 statement ok
-select max(l_comment) from read_parquet('fakes3://lineitem.parquet');
+load ducklake
 
-# DuckDB's external file cache should be EMPTY (Parquet bypasses it)
+statement ok
+ATTACH 'ducklake:fake_s3://network.ducklake' AS my_ducklake;
+
+statement ok
+create or replace table my_ducklake.supplier as (from supplier);
+
+statement ok
+select max(s_suppkey) from my_ducklake.supplier;
+
+# we should get caching
 query I
-select count(*) from duckdb_external_file_cache();
+select count(*) from blobcache_stats();
 ----
-0
-
-# Our cache should be POPULATED (Parquet goes through our cache)
-query I
-select count(*) > 0 from blobcache_stats();
-----
-1
-
+49
