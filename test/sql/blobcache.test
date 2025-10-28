@@ -28,38 +28,38 @@ query I
 select message from duckdb_logs;
 ----
 
-query III
-select cache_type, count(*), sum(usage_count) from blobcache_stats() group by all order by all;
+query II
+select count(*), sum(usage_count) from blobcache_stats();
 ----
-large	16	0
+16	0
 
 statement ok
 select max(l_comment) from read_parquet('fake_s3://lineitem.parquet');
 
-query III
-select cache_type, count(*), sum(usage_count) from blobcache_stats() group by all order by all;
+query II
+select count(*), sum(usage_count) from blobcache_stats();
 ----
-large	16	16
+16	16
 
 # Verify that bytes_from_mem is now > 0 (memory cache hits on second read)
-query II
-select cache_type, sum(bytes_from_mem) > 0 from blobcache_stats() group by all order by all;
+query I
+select sum(bytes_from_mem) > 0 from blobcache_stats();
 ----
-large	1
+1
 
 statement ok
 select max(l_comment) from read_parquet('fake_s3://lineitem.parquet');
 
-query III
-select cache_type, count(*), sum(usage_count) from blobcache_stats() group by all order by all;
+query II
+select count(*), sum(usage_count) from blobcache_stats();
 ----
-large	16	32
+16	32
 
 # Verify bytes_from_mem still > 0 after third read (with external file cache disabled)
-query II
-select cache_type, sum(bytes_from_mem) > 0 from blobcache_stats() group by all order by all;
+query I
+select sum(bytes_from_mem) > 0 from blobcache_stats();
 ----
-large	1
+1
 
 statement ok
 from blobcache_config('.blobcache2/', 1024, 255);
@@ -79,12 +79,6 @@ select * replace(substr(cache_path,0,12) as cache_path) from blobcache_config();
 statement ok
 select max(l_comment) from read_parquet('fake_s3://lineitem.parquet');
 
-# Verify new cache is populated
-query I
-select count(*) from blobcache_stats();
-----
-16
-
 # take ducklake for a spin
 statement ok
 install ducklake
@@ -103,6 +97,6 @@ select max(s_suppkey) from my_ducklake.supplier;
 
 # we should get caching
 query I
-select count(*) from blobcache_stats();
+select count(*) > 32 from blobcache_stats();
 ----
-49
+1

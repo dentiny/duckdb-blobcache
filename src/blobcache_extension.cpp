@@ -144,10 +144,9 @@ static unique_ptr<GlobalTableFunctionState> BlobCacheStatsInitGlobal(ClientConte
 // Bind function for blobcache_stats
 static unique_ptr<FunctionData> BlobCacheStatsBind(ClientContext &context, TableFunctionBindInput &input,
                                                    vector<LogicalType> &return_types, vector<string> &names) {
-	// Setup return schema - returns cache statistics with 11 columns
+	// Setup return schema - returns cache statistics with 10 columns
 	return_types.push_back(LogicalType::VARCHAR); // protocol
 	return_types.push_back(LogicalType::VARCHAR); // uri
-	return_types.push_back(LogicalType::VARCHAR); // cache_type
 	return_types.push_back(LogicalType::VARCHAR); // file
 	return_types.push_back(LogicalType::BIGINT);  // range_start_file
 	return_types.push_back(LogicalType::BIGINT);  // range_start_uri
@@ -158,7 +157,6 @@ static unique_ptr<FunctionData> BlobCacheStatsBind(ClientContext &context, Table
 
 	names.push_back("protocol");
 	names.push_back("uri");
-	names.push_back("cache_type");
 	names.push_back("file");
 	names.push_back("range_start_file");
 	names.push_back("range_start_uri");
@@ -221,8 +219,7 @@ static void BlobCacheConfigFunction(ClientContext &context, TableFunctionInput &
 	if (shared_cache && shared_cache->state.blobcache_initialized) {
 		cache_path = shared_cache->state.blobcache_dir;
 		max_size_bytes = shared_cache->state.total_cache_capacity;
-		current_size_bytes =
-		    shared_cache->smallrange_map->current_cache_size + shared_cache->largerange_map->current_cache_size;
+		current_size_bytes = shared_cache->cache_map->current_cache_size;
 		writer_threads = shared_cache->nr_io_threads;
 	}
 
@@ -244,18 +241,13 @@ static void BlobCacheStatsFunction(ClientContext &context, TableFunctionInput &d
 	if (global_state.tuples_processed == 0) {
 		auto cache = GetOrCreateBlobCache(*context.db);
 		std::lock_guard<std::mutex> lock(cache->blobcache_mutex);
-		global_state.smallrange_stats = cache->smallrange_map->GetStatistics();
-		global_state.largerange_stats = cache->largerange_map->GetStatistics();
+		global_state.smallrange_stats = cache->cache_map->GetStatistics();
+		global_state.largerange_stats.clear(); // No longer used
 	}
 
-	// Determine which cache to serve from
-	auto &stats = (global_state.tuples_processed < global_state.smallrange_stats.size())
-	                  ? global_state.smallrange_stats
-	                  : global_state.largerange_stats;
-	auto cache_type = (global_state.tuples_processed < global_state.smallrange_stats.size()) ? "small" : "large";
-	idx_t offset = (global_state.tuples_processed < global_state.smallrange_stats.size())
-	                   ? global_state.tuples_processed
-	                   : global_state.tuples_processed - global_state.smallrange_stats.size();
+	// Use single cache stats
+	auto &stats = global_state.smallrange_stats;
+	idx_t offset = global_state.tuples_processed;
 
 	idx_t chunk_size = MinValue<idx_t>(STANDARD_VECTOR_SIZE, stats.size() - offset);
 	output.SetCardinality(chunk_size);
@@ -264,14 +256,13 @@ static void BlobCacheStatsFunction(ClientContext &context, TableFunctionInput &d
 		const auto &info = stats[offset + i];
 		output.data[0].SetValue(i, Value(info.protocol));
 		output.data[1].SetValue(i, Value(info.uri));
-		output.data[2].SetValue(i, Value(cache_type));
-		output.data[3].SetValue(i, Value(info.file));
-		output.data[4].SetValue(i, Value::BIGINT(info.range_start_file));
-		output.data[5].SetValue(i, Value::BIGINT(info.range_start_uri));
-		output.data[6].SetValue(i, Value::BIGINT(info.range_size));
-		output.data[7].SetValue(i, Value::BIGINT(info.usage_count));
-		output.data[8].SetValue(i, Value::BIGINT(info.bytes_from_cache));
-		output.data[9].SetValue(i, Value::BIGINT(info.bytes_from_mem));
+		output.data[2].SetValue(i, Value(info.file));
+		output.data[3].SetValue(i, Value::BIGINT(info.range_start_file));
+		output.data[4].SetValue(i, Value::BIGINT(info.range_start_uri));
+		output.data[5].SetValue(i, Value::BIGINT(info.range_size));
+		output.data[6].SetValue(i, Value::BIGINT(info.usage_count));
+		output.data[7].SetValue(i, Value::BIGINT(info.bytes_from_cache));
+		output.data[8].SetValue(i, Value::BIGINT(info.bytes_from_mem));
 	}
 	global_state.tuples_processed += chunk_size;
 }
