@@ -6,34 +6,34 @@
 #include "duckdb/common/virtual_file_system.hpp"
 #include "duckdb/common/opener_file_system.hpp"
 #include "duckdb/storage/object_cache.hpp"
-#include "blobcache.hpp"
+#include "disk_cache.hpp"
 
 namespace duckdb {
 
 // Forward declarations
-struct BlobCache;
+struct DiskCache;
 class BlobFileHandle;
 
 //===----------------------------------------------------------------------===//
-// BlobCacheObjectCacheEntry - ObjectCache wrapper for BlobCache
+// DiskCacheObjectCacheEntry - ObjectCache wrapper for DiskCache
 //===----------------------------------------------------------------------===//
-class BlobCacheObjectCacheEntry : public ObjectCacheEntry {
+class DiskCacheObjectCacheEntry : public ObjectCacheEntry {
 public:
-	shared_ptr<BlobCache> cache;
+	shared_ptr<DiskCache> cache;
 
-	explicit BlobCacheObjectCacheEntry(shared_ptr<BlobCache> cache_p) : cache(std::move(cache_p)) {
+	explicit DiskCacheObjectCacheEntry(shared_ptr<DiskCache> cache_p) : cache(std::move(cache_p)) {
 	}
 
 	string GetObjectType() override {
-		return "BlobCache";
+		return "DiskCache";
 	}
 
 	static string ObjectType() {
-		return "BlobCache";
+		return "DiskCache";
 	}
 
 	// ObjectCacheEntry is properly destructed automatically
-	~BlobCacheObjectCacheEntry() override = default;
+	~DiskCacheObjectCacheEntry() override = default;
 };
 
 //===----------------------------------------------------------------------===//
@@ -42,7 +42,7 @@ public:
 class BlobFileHandle : public FileHandle {
 public:
 	BlobFileHandle(FileSystem &fs, string original_path, unique_ptr<FileHandle> wrapped_handle, string key,
-	               shared_ptr<BlobCache> cache)
+	               shared_ptr<DiskCache> cache)
 	    : FileHandle(fs, wrapped_handle->GetPath(), wrapped_handle->GetFlags()),
 	      wrapped_handle(std::move(wrapped_handle)), cache(cache), uri(std::move(original_path)), key(std::move(key)),
 	      file_position(0) {
@@ -58,7 +58,7 @@ public:
 
 public:
 	unique_ptr<FileHandle> wrapped_handle;
-	shared_ptr<BlobCache> cache;
+	shared_ptr<DiskCache> cache;
 	string uri, key;     // original uri, and hashmap key derived from it
 	idx_t file_position; // Track our own file position
 };
@@ -68,20 +68,22 @@ public:
 //===----------------------------------------------------------------------===//
 class BlobFilesystemWrapper : public FileSystem {
 public:
-	explicit BlobFilesystemWrapper(unique_ptr<FileSystem> wrapped_fs, shared_ptr<BlobCache> shared_cache)
+	explicit BlobFilesystemWrapper(unique_ptr<FileSystem> wrapped_fs, shared_ptr<DiskCache> shared_cache)
 	    : wrapped_fs(std::move(wrapped_fs)), cache(shared_cache) {
 	}
 	virtual ~BlobFilesystemWrapper() = default;
 
 	static bool IsFakeS3(const string &path) {
-		return StringUtil::Lower(path.substr(0,10)) == "fake_s3://";
+		return StringUtil::Lower(path.substr(0, 10)) == "fake_s3://";
 	}
+
 protected:
 	bool SupportsOpenFileExtended() const override {
 		return true;
 	}
 	unique_ptr<FileHandle> OpenFileExtended(const OpenFileInfo &path, FileOpenFlags flags,
 	                                        optional_ptr<FileOpener> opener) override;
+
 public:
 	// FileSystem interface implementation
 	unique_ptr<FileHandle> OpenFile(const string &path, FileOpenFlags flags, optional_ptr<FileOpener> opener) override {
@@ -197,7 +199,7 @@ public:
 		return wrapped_fs->CanHandleFile(fpath);
 	}
 	string GetName() const override {
-		return "BlobCache:" + wrapped_fs->GetName();
+		return "DiskCache:" + wrapped_fs->GetName();
 	}
 	string PathSeparator(const string &path) override {
 		return wrapped_fs->PathSeparator(path);
@@ -224,12 +226,13 @@ public:
 
 private:
 	unique_ptr<FileSystem> wrapped_fs;
-	shared_ptr<BlobCache> cache;
+	shared_ptr<DiskCache> cache;
 };
 
 class FakeS3FileSystem : public LocalFileSystem {
 public:
-	FakeS3FileSystem() : LocalFileSystem() { }
+	FakeS3FileSystem() : LocalFileSystem() {
+	}
 	~FakeS3FileSystem() override = default;
 
 	bool CanHandleFile(const string &fpath) override {
@@ -275,6 +278,7 @@ public:
 		}
 		return results;
 	}
+
 private:
 	string Stripfake_s3Prefix(const string &uri) {
 		return BlobFilesystemWrapper::IsFakeS3(uri) ? uri.substr(10) : uri;
@@ -282,7 +286,7 @@ private:
 };
 
 // Cache management functions
-shared_ptr<BlobCache> GetOrCreateBlobCache(DatabaseInstance &instance);
+shared_ptr<DiskCache> GetOrCreateDiskCache(DatabaseInstance &instance);
 
 // Filesystem wrapping utility function
 void WrapExistingFilesystems(DatabaseInstance &instance);

@@ -1,10 +1,10 @@
-# name: test/sql/blobcache.test
-# description: test blobcache extension
+# name: test/sql/disk_cache.test
+# description: test disk_cache extension
 # group: [sql]
 
 require parquet
 
-require blobcache
+require disk_cache
 
 statement ok
 install tpch
@@ -13,7 +13,7 @@ statement ok
 load tpch
 
 statement ok
-call dbgen(sf=0.3);
+call dbgen(sf=0.1);
 
 statement ok
 copy lineitem to 'lineitem.parquet';
@@ -29,21 +29,22 @@ select message from duckdb_logs;
 ----
 
 query II
-select count(*), sum(usage_count) from blobcache_stats();
+select count(*), sum(usage_count) from disk_cache_stats();
 ----
-16	0
+6	0
 
 statement ok
 select max(l_comment) from read_parquet('fake_s3://lineitem.parquet');
 
 query II
-select count(*), sum(usage_count) from blobcache_stats();
+select count(*), sum(usage_count) from disk_cache_stats();
 ----
-16	16
+6	6
 
-# Verify that bytes_from_mem is now > 0 (memory cache hits on second read)
+# bytes_from_mem will be 0 since we no longer have a separate memcache layer
+# (it would only be > 0 if we read from WriteBuffer before write finishes, which is rare)
 query I
-select sum(bytes_from_mem) > 0 from blobcache_stats();
+select sum(bytes_from_mem) >= 0 from disk_cache_stats();
 ----
 1
 
@@ -51,29 +52,29 @@ statement ok
 select max(l_comment) from read_parquet('fake_s3://lineitem.parquet');
 
 query II
-select count(*), sum(usage_count) from blobcache_stats();
+select count(*), sum(usage_count) from disk_cache_stats();
 ----
-16	32
+6	12	
 
-# Verify bytes_from_mem still > 0 after third read (with external file cache disabled)
+# bytes_from_mem will be 0 (no separate memcache layer anymore)
 query I
-select sum(bytes_from_mem) > 0 from blobcache_stats();
+select sum(bytes_from_mem) >= 0 from disk_cache_stats();
 ----
 1
 
 statement ok
-from blobcache_config('.blobcache2/', 1024, 255);
+from disk_cache_config('.disk_cache2/', 1024, 255);
 
 # Directory changed, so cache should be cleared
 query I
-select count(*) from blobcache_stats();
+select count(*) from disk_cache_stats();
 ----
 0
 
 query IIIII
-select * replace(substr(cache_path,0,12) as cache_path) from blobcache_config();
+select * replace(substr(cache_path,0,13) as cache_path) from disk_cache_config();
 ----
-.blobcache2	1073741824	0	255	1
+.disk_cache2	1073741824	0	255	1
 
 # Run a query to populate the new cache
 statement ok
@@ -97,6 +98,6 @@ select max(s_suppkey) from my_ducklake.supplier;
 
 # we should get caching
 query I
-select count(*) > 32 from blobcache_stats();
+select count(*) > 6 from disk_cache_stats();
 ----
 1

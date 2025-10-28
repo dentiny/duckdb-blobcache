@@ -1,5 +1,5 @@
-#include "blobfs_wrapper.hpp"
-#include "blobcache.hpp"
+#include "disk_cache_fs_wrapper.hpp"
+#include "disk_cache.hpp"
 
 namespace duckdb {
 
@@ -8,12 +8,12 @@ namespace duckdb {
 //===----------------------------------------------------------------------===//
 
 unique_ptr<FileHandle> BlobFilesystemWrapper::OpenFileExtended(const OpenFileInfo &info, FileOpenFlags flags,
-                                        				       optional_ptr<FileOpener> opener)  {
+                                                               optional_ptr<FileOpener> opener) {
 	auto wrapped_handle = wrapped_fs->OpenFile(info.path, flags, opener);
 	if (!wrapped_handle || (!IsFakeS3(info.path) && wrapped_fs->OnDiskFile(*wrapped_handle))) {
 		return wrapped_handle; // Never cache file:// URLs as they are already local
 	}
-	auto lakecache_file = IsFakeS3(info.path) || cache->CacheUnsafely(info.path, opener);
+	auto lakecache_file = IsFakeS3(info.path) || cache->CacheUnsafely(info.path);
 	if (!lakecache_file && info.extended_info) {
 		// parquet_scan specialized for a Lake (duck,ice,delta) switch off validation, this allows for safe caching
 		const auto &open_options = info.extended_info->options;
@@ -25,15 +25,14 @@ unique_ptr<FileHandle> BlobFilesystemWrapper::OpenFileExtended(const OpenFileInf
 	if (!lakecache_file) {
 		return wrapped_handle; // don't cache, return a normal handle
 	}
-	auto key = cache->state.GenCacheKey(info.path);
+	auto key = cache->GenCacheKey(info.path);
 	return make_uniq<BlobFileHandle>(*this, info.path, std::move(wrapped_handle), key, cache);
 }
 
-
 static idx_t ReadChunk(duckdb::FileSystem &wrapped_fs, BlobFileHandle &handle, char *buf, idx_t location, idx_t len) {
 	// NOTE: ReadFromCache() can return cached_bytes == 0 but adjust max_nr_bytes downwards to align with a cached range
-	handle.cache->state.LogDebug("ReadChunk(path=" + handle.uri + ", location=" + to_string(location) +
-	                             ", max_nr_bytes=" + to_string(len) + ")");
+	handle.cache->LogDebug("ReadChunk(path=" + handle.uri + ", location=" + to_string(location) +
+	                       ", max_nr_bytes=" + to_string(len) + ")");
 	idx_t nr_cached = handle.cache->ReadFromCache(handle.key, handle.uri, location, len, buf);
 #if 0
     if (nr_cached > 0) { // debug
@@ -65,7 +64,7 @@ static idx_t ReadChunk(duckdb::FileSystem &wrapped_fs, BlobFileHandle &handle, c
 
 void BlobFilesystemWrapper::Read(FileHandle &handle, void *buf, int64_t nr_bytes, idx_t location) {
 	auto &blob_handle = handle.Cast<BlobFileHandle>();
-	if (!blob_handle.cache || !cache->state.blobcache_initialized) {
+	if (!blob_handle.cache || !cache->disk_cache_initialized) {
 		wrapped_fs->Read(*blob_handle.wrapped_handle, buf, nr_bytes, location);
 		return; // a read that cannot cache
 	}
@@ -82,7 +81,7 @@ void BlobFilesystemWrapper::Read(FileHandle &handle, void *buf, int64_t nr_bytes
 
 int64_t BlobFilesystemWrapper::Read(FileHandle &handle, void *buf, int64_t nr_bytes) {
 	auto &blob_handle = handle.Cast<BlobFileHandle>();
-	if (!blob_handle.cache || !cache->state.blobcache_initialized) {
+	if (!blob_handle.cache || !cache->disk_cache_initialized) {
 		return wrapped_fs->Read(*blob_handle.wrapped_handle, buf, nr_bytes);
 	}
 	return ReadChunk(*wrapped_fs, blob_handle, static_cast<char *>(buf), blob_handle.file_position, nr_bytes);
@@ -91,9 +90,8 @@ int64_t BlobFilesystemWrapper::Read(FileHandle &handle, void *buf, int64_t nr_by
 void BlobFilesystemWrapper::Write(FileHandle &handle, void *buf, int64_t nr_bytes, idx_t location) {
 	auto &blob_handle = handle.Cast<BlobFileHandle>();
 	wrapped_fs->Write(*blob_handle.wrapped_handle, buf, nr_bytes, location);
-	if (blob_handle.cache && cache->state.blobcache_initialized) {
-		blob_handle.cache->InsertCache(blob_handle.key, blob_handle.uri, location, nr_bytes, buf);
-	}
+	// Don't cache writes - they go directly to the underlying filesystem
+	// Subsequent reads will cache the data normally
 	// Update position after write at explicit location
 	blob_handle.file_position = location + nr_bytes;
 }
@@ -102,9 +100,8 @@ int64_t BlobFilesystemWrapper::Write(FileHandle &handle, void *buf, int64_t nr_b
 	auto &blob_handle = handle.Cast<BlobFileHandle>();
 	nr_bytes = wrapped_fs->Write(*blob_handle.wrapped_handle, buf, nr_bytes);
 	if (nr_bytes > 0) {
-		if (blob_handle.cache && cache->state.blobcache_initialized) {
-			blob_handle.cache->InsertCache(blob_handle.key, blob_handle.uri, blob_handle.file_position, nr_bytes, buf);
-		}
+		// Don't cache writes - they go directly to the underlying filesystem
+		// Subsequent reads will cache the data normally
 		blob_handle.file_position += nr_bytes;
 	}
 	return nr_bytes;
@@ -136,21 +133,21 @@ void BlobFilesystemWrapper::RemoveFile(const string &uri, optional_ptr<FileOpene
 //===----------------------------------------------------------------------===//
 // Cache Management Functions
 //===----------------------------------------------------------------------===//
-shared_ptr<BlobCache> GetOrCreateBlobCache(DatabaseInstance &instance) {
+shared_ptr<DiskCache> GetOrCreateDiskCache(DatabaseInstance &instance) {
 	auto &object_cache = instance.GetObjectCache();
 
 	// Try to get existing cache
-	auto cached_entry = object_cache.Get<BlobCacheObjectCacheEntry>("blobcache_instance");
+	auto cached_entry = object_cache.Get<DiskCacheObjectCacheEntry>("disk_cache_instance");
 	if (cached_entry) {
-		DUCKDB_LOG_DEBUG(instance, "[BlobCache] Retrieved existing BlobCache from ObjectCache");
+		DUCKDB_LOG_DEBUG(instance, "[DiskCache] Retrieved existing DiskCache from ObjectCache");
 		return cached_entry->cache;
 	}
 
 	// Create new cache and store in ObjectCache
-	auto new_cache = make_shared_ptr<BlobCache>(&instance);
-	auto cache_entry = make_shared_ptr<BlobCacheObjectCacheEntry>(new_cache);
-	object_cache.Put("blobcache_instance", cache_entry);
-	DUCKDB_LOG_DEBUG(instance, "[BlobCache] Created and stored new BlobCache in ObjectCache");
+	auto new_cache = make_shared_ptr<DiskCache>(&instance);
+	auto cache_entry = make_shared_ptr<DiskCacheObjectCacheEntry>(new_cache);
+	object_cache.Put("disk_cache_instance", cache_entry);
+	DUCKDB_LOG_DEBUG(instance, "[DiskCache] Created and stored new DiskCache in ObjectCache");
 
 	return new_cache;
 }
@@ -158,56 +155,56 @@ shared_ptr<BlobCache> GetOrCreateBlobCache(DatabaseInstance &instance) {
 void WrapExistingFilesystems(DatabaseInstance &instance) {
 	auto &db_fs = FileSystem::GetFileSystem(instance);
 	bool fake_s3_seen = false;
-	DUCKDB_LOG_DEBUG(instance, "[BlobCache] Filesystem type: %s", db_fs.GetName().c_str());
+	DUCKDB_LOG_DEBUG(instance, "[DiskCache] Filesystem type: %s", db_fs.GetName().c_str());
 
 	// Get VirtualFileSystem
 	auto vfs = dynamic_cast<VirtualFileSystem *>(&db_fs);
 	if (!vfs) {
 		auto *opener_fs = dynamic_cast<OpenerFileSystem *>(&db_fs);
 		if (opener_fs) {
-			DUCKDB_LOG_DEBUG(instance, "[BlobCache] Found OpenerFileSystem, getting wrapped VFS");
+			DUCKDB_LOG_DEBUG(instance, "[DiskCache] Found OpenerFileSystem, getting wrapped VFS");
 			vfs = dynamic_cast<VirtualFileSystem *>(&opener_fs->GetFileSystem());
 		}
 	}
 	if (!vfs) {
-		DUCKDB_LOG_DEBUG(instance, "[BlobCache] Cannot find VirtualFileSystem - skipping filesystem wrapping");
+		DUCKDB_LOG_DEBUG(instance, "[DiskCache] Cannot find VirtualFileSystem - skipping filesystem wrapping");
 		return;
 	}
 
 	// Get the shared cache instance - only proceed if cache is initialized
-	auto shared_cache = GetOrCreateBlobCache(instance);
-	if (!shared_cache->state.blobcache_initialized) {
-		DUCKDB_LOG_DEBUG(instance, "[BlobCache] Cache not initialized yet, skipping filesystem wrapping");
+	auto shared_cache = GetOrCreateDiskCache(instance);
+	if (!shared_cache->disk_cache_initialized) {
+		DUCKDB_LOG_DEBUG(instance, "[DiskCache] Cache not initialized yet, skipping filesystem wrapping");
 		return;
 	}
 	// Try to wrap each blob storage filesystem
 	auto subsystems = vfs->ListSubSystems();
-	DUCKDB_LOG_DEBUG(instance, "[BlobCache] Found %zu registered subsystems", subsystems.size());
+	DUCKDB_LOG_DEBUG(instance, "[DiskCache] Found %zu registered subsystems", subsystems.size());
 
 	for (const auto &name : subsystems) {
-		DUCKDB_LOG_DEBUG(instance, "[BlobCache] Processing subsystem: '%s'", name.c_str());
+		DUCKDB_LOG_DEBUG(instance, "[DiskCache] Processing subsystem: '%s'", name.c_str());
 
-		// Skip if already wrapped (starts with "BlobCache:")
-		if (name.find("BlobCache:") == 0) {
-			fake_s3_seen |=  (name == "BlobCache:fake_s3");
-			DUCKDB_LOG_DEBUG(instance, "[BlobCache] Skipping already wrapped subsystem: '%s'", name.c_str());
+		// Skip if already wrapped (starts with "DiskCache:")
+		if (name.find("DiskCache:") == 0) {
+			fake_s3_seen |= (name == "DiskCache:fake_s3");
+			DUCKDB_LOG_DEBUG(instance, "[DiskCache] Skipping already wrapped subsystem: '%s'", name.c_str());
 			continue;
 		}
 
 		auto extracted_fs = vfs->ExtractSubSystem(name);
 		if (extracted_fs) {
-			DUCKDB_LOG_DEBUG(instance, "[BlobCache] Successfully extracted subsystem: '%s' (GetName returns: '%s')",
+			DUCKDB_LOG_DEBUG(instance, "[DiskCache] Successfully extracted subsystem: '%s' (GetName returns: '%s')",
 			                 name.c_str(), extracted_fs->GetName().c_str());
 			auto wrapped_fs = make_uniq<BlobFilesystemWrapper>(std::move(extracted_fs), shared_cache);
-			DUCKDB_LOG_DEBUG(instance, "[BlobCache] Created wrapper with name: '%s'", wrapped_fs->GetName().c_str());
+			DUCKDB_LOG_DEBUG(instance, "[DiskCache] Created wrapper with name: '%s'", wrapped_fs->GetName().c_str());
 			vfs->RegisterSubSystem(std::move(wrapped_fs));
-			DUCKDB_LOG_DEBUG(instance, "[BlobCache] Successfully registered wrapped subsystem for '%s'", name.c_str());
+			DUCKDB_LOG_DEBUG(instance, "[DiskCache] Successfully registered wrapped subsystem for '%s'", name.c_str());
 		} else {
-			DUCKDB_LOG_ERROR(instance, "[BlobCache] Failed to extract '%s' - subsystem not wrapped", name.c_str());
+			DUCKDB_LOG_ERROR(instance, "[DiskCache] Failed to extract '%s' - subsystem not wrapped", name.c_str());
 		}
 	}
 	if (!fake_s3_seen) { // Register fakes3:// filesystem for testing purposes - wrapped with caching
-		DUCKDB_LOG_DEBUG(instance, "[BlobCache] Registering fake_s3:// filesystem for testing");
+		DUCKDB_LOG_DEBUG(instance, "[DiskCache] Registering fake_s3:// filesystem for testing");
 		auto fake_s3_fs = make_uniq<FakeS3FileSystem>();
 		auto wrapped_fake_s3_fs = make_uniq<BlobFilesystemWrapper>(std::move(fake_s3_fs), shared_cache);
 		vfs->RegisterSubSystem(std::move(wrapped_fake_s3_fs));
@@ -215,9 +212,9 @@ void WrapExistingFilesystems(DatabaseInstance &instance) {
 
 	// Log final subsystem list
 	auto final_subsystems = vfs->ListSubSystems();
-	DUCKDB_LOG_DEBUG(instance, "[BlobCache] After wrapping, have %zu subsystems", final_subsystems.size());
+	DUCKDB_LOG_DEBUG(instance, "[DiskCache] After wrapping, have %zu subsystems", final_subsystems.size());
 	for (const auto &name : final_subsystems) {
-		DUCKDB_LOG_DEBUG(instance, "[BlobCache] - %s", name.c_str());
+		DUCKDB_LOG_DEBUG(instance, "[DiskCache] - %s", name.c_str());
 	}
 }
 
