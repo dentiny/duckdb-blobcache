@@ -67,7 +67,7 @@ public:
 	virtual ~BlobFilesystemWrapper() = default;
 
 	static bool IsFakeS3(const string &path) {
-		return StringUtil::Lower(path.substr(0, 8)) == "fake_s3:";
+		return StringUtil::Lower(path.substr(0, 10)) == "fake_s3://";
 	}
 
 protected:
