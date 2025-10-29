@@ -90,44 +90,27 @@ int64_t BlobFilesystemWrapper::Read(FileHandle &handle, void *buf, int64_t nr_by
 void BlobFilesystemWrapper::Write(FileHandle &handle, void *buf, int64_t nr_bytes, idx_t location) {
 	auto &blob_handle = handle.Cast<BlobFileHandle>();
 	wrapped_fs->Write(*blob_handle.wrapped_handle, buf, nr_bytes, location);
-	// Don't cache writes - they go directly to the underlying filesystem
-	// Subsequent reads will cache the data normally
-	// Update position after write at explicit location
 	blob_handle.file_position = location + nr_bytes;
+
+	// Cache the written data
+	if (blob_handle.cache && cache->disk_cache_initialized) {
+		blob_handle.cache->InsertCache(blob_handle.key, blob_handle.uri, location, nr_bytes, buf);
+	}
 }
 
 int64_t BlobFilesystemWrapper::Write(FileHandle &handle, void *buf, int64_t nr_bytes) {
 	auto &blob_handle = handle.Cast<BlobFileHandle>();
+	idx_t write_location = blob_handle.file_position;
 	nr_bytes = wrapped_fs->Write(*blob_handle.wrapped_handle, buf, nr_bytes);
 	if (nr_bytes > 0) {
-		// Don't cache writes - they go directly to the underlying filesystem
-		// Subsequent reads will cache the data normally
 		blob_handle.file_position += nr_bytes;
+
+		// Cache the written data
+		if (blob_handle.cache && cache->disk_cache_initialized) {
+			blob_handle.cache->InsertCache(blob_handle.key, blob_handle.uri, write_location, nr_bytes, buf);
+		}
 	}
 	return nr_bytes;
-}
-
-void BlobFilesystemWrapper::Truncate(FileHandle &handle, int64_t new_size) {
-	auto &blob_handle = handle.Cast<BlobFileHandle>();
-	if (blob_handle.cache) {
-		blob_handle.cache->EvictFile(blob_handle.key);
-	}
-	wrapped_fs->Truncate(*blob_handle.wrapped_handle, new_size);
-}
-
-void BlobFilesystemWrapper::MoveFile(const string &source, const string &target, optional_ptr<FileOpener> opener) {
-	if (cache) {
-		cache->EvictFile(source);
-		cache->EvictFile(target);
-	}
-	wrapped_fs->MoveFile(source, target, opener);
-}
-
-void BlobFilesystemWrapper::RemoveFile(const string &uri, optional_ptr<FileOpener> opener) {
-	if (cache) {
-		cache->EvictFile(uri);
-	}
-	wrapped_fs->RemoveFile(uri, opener);
 }
 
 //===----------------------------------------------------------------------===//
@@ -177,7 +160,12 @@ void WrapExistingFilesystems(DatabaseInstance &instance) {
 		DUCKDB_LOG_DEBUG(instance, "[DiskCache] Cache not initialized yet, skipping filesystem wrapping");
 		return;
 	}
-	// Try to wrap each blob storage filesystem
+
+	// Target blob storage filesystems to wrap
+	vector<string> target_filesystems = {"AzureBlobStorageFileSystem", "HuggingFaceFileSystem", "S3FileSystem",
+	                                     "HTTPFileSystem"}; // this one is used for http[s], gcs and r2
+
+	// Try to wrap each target blob storage filesystem
 	auto subsystems = vfs->ListSubSystems();
 	DUCKDB_LOG_DEBUG(instance, "[DiskCache] Found %zu registered subsystems", subsystems.size());
 
@@ -188,6 +176,19 @@ void WrapExistingFilesystems(DatabaseInstance &instance) {
 		if (name.find("DiskCache:") == 0) {
 			fake_s3_seen |= (name == "DiskCache:fake_s3");
 			DUCKDB_LOG_DEBUG(instance, "[DiskCache] Skipping already wrapped subsystem: '%s'", name.c_str());
+			continue;
+		}
+
+		// Only wrap target blob storage filesystems
+		bool is_target = false;
+		for (const auto &target : target_filesystems) {
+			if (name == target) {
+				is_target = true;
+				break;
+			}
+		}
+		if (!is_target) {
+			DUCKDB_LOG_DEBUG(instance, "[DiskCache] Skipping non-target subsystem: '%s'", name.c_str());
 			continue;
 		}
 

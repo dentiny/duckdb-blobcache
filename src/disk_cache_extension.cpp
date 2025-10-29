@@ -23,11 +23,9 @@ struct DiskCacheConfigBindData : public FunctionData {
 	    : directory(std::move(dir)), max_size_mb(size), nr_io_threads(threads), regex_patterns(std::move(regexps)),
 	      query_only(query) {
 	}
-
 	unique_ptr<FunctionData> Copy() const override {
 		return make_uniq<DiskCacheConfigBindData>(directory, max_size_mb, nr_io_threads, regex_patterns, query_only);
 	}
-
 	bool Equals(const FunctionData &other_p) const override {
 		auto &other = other_p.Cast<DiskCacheConfigBindData>();
 		return directory == other.directory && max_size_mb == other.max_size_mb &&
@@ -77,26 +75,23 @@ static unique_ptr<FunctionData> DiskCacheConfigBind(ClientContext &context, Tabl
 	if (input.inputs.size() == 0) {
 		query_only = true;
 	}
-
-	// Parse arguments if provided
+	// Parse arguments if provided (max_size_mb, directory, nr_io_threads, regex_patterns)
 	if (input.inputs.size() >= 1) {
 		if (input.inputs[0].IsNull()) {
-			throw BinderException("disk_cache_config: directory cannot be NULL");
-		}
-		directory = StringValue::Get(input.inputs[0]);
-	}
-
-	if (input.inputs.size() >= 2) {
-		if (input.inputs[1].IsNull()) {
 			throw BinderException("disk_cache_config: max_size_mb cannot be NULL");
 		}
-		auto size_val = input.inputs[1];
+		auto size_val = input.inputs[0];
 		if (size_val.type().id() != LogicalTypeId::BIGINT && size_val.type().id() != LogicalTypeId::INTEGER) {
 			throw BinderException("disk_cache_config: max_size_mb must be an integer");
 		}
 		max_size_mb = size_val.GetValue<idx_t>();
 	}
-
+	if (input.inputs.size() >= 2) {
+		if (input.inputs[1].IsNull()) {
+			throw BinderException("disk_cache_config: directory cannot be NULL");
+		}
+		directory = StringValue::Get(input.inputs[1]);
+	}
 	if (input.inputs.size() >= 3) {
 		if (input.inputs[2].IsNull()) {
 			throw BinderException("disk_cache_config: nr_io_threads cannot be NULL");
@@ -113,7 +108,6 @@ static unique_ptr<FunctionData> DiskCacheConfigBind(ClientContext &context, Tabl
 			throw BinderException("disk_cache_config: nr_io_threads cannot exceed 256");
 		}
 	}
-
 	if (input.inputs.size() >= 4) {
 		if (input.inputs[3].IsNull()) {
 			throw BinderException("disk_cache_config: regex_patterns cannot be NULL");
@@ -124,7 +118,6 @@ static unique_ptr<FunctionData> DiskCacheConfigBind(ClientContext &context, Tabl
 		}
 		regex_patterns = StringValue::Get(patterns_val);
 	}
-
 	return make_uniq<DiskCacheConfigBindData>(std::move(directory), max_size_mb, nr_io_threads,
 	                                          std::move(regex_patterns), query_only);
 }
@@ -144,11 +137,10 @@ static unique_ptr<GlobalTableFunctionState> DiskCacheStatsInitGlobal(ClientConte
 // Bind function for disk_cache_stats
 static unique_ptr<FunctionData> DiskCacheStatsBind(ClientContext &context, TableFunctionBindInput &input,
                                                    vector<LogicalType> &return_types, vector<string> &names) {
-	// Setup return schema - returns cache statistics with 9 columns
+	// Setup return schema - returns cache statistics with 8 columns
 	return_types.push_back(LogicalType::VARCHAR); // protocol
 	return_types.push_back(LogicalType::VARCHAR); // uri
 	return_types.push_back(LogicalType::VARCHAR); // file
-	return_types.push_back(LogicalType::BIGINT);  // range_start_file
 	return_types.push_back(LogicalType::BIGINT);  // range_start_uri
 	return_types.push_back(LogicalType::BIGINT);  // range_size
 	return_types.push_back(LogicalType::BIGINT);  // usage_count
@@ -158,7 +150,6 @@ static unique_ptr<FunctionData> DiskCacheStatsBind(ClientContext &context, Table
 	names.push_back("protocol");
 	names.push_back("uri");
 	names.push_back("file");
-	names.push_back("range_start_file");
 	names.push_back("range_start_uri");
 	names.push_back("range_size");
 	names.push_back("usage_count");
@@ -177,7 +168,6 @@ static void DiskCacheConfigFunction(ClientContext &context, TableFunctionInput &
 		output.SetCardinality(0);
 		return;
 	}
-
 	DUCKDB_LOG_DEBUG(*context.db, "[DiskCache] disk_cache_config called");
 
 	// Process the single configuration tuple
@@ -214,7 +204,6 @@ static void DiskCacheConfigFunction(ClientContext &context, TableFunctionInput &
 			WrapExistingFilesystems(*context.db);
 		}
 	}
-
 	// Get current cache statistics (works whether configuration succeeded or not)
 	if (shared_cache && shared_cache->disk_cache_initialized) {
 		cache_path = shared_cache->disk_cache_dir;
@@ -222,7 +211,6 @@ static void DiskCacheConfigFunction(ClientContext &context, TableFunctionInput &
 		current_size_bytes = shared_cache->current_cache_size;
 		writer_threads = shared_cache->nr_io_threads;
 	}
-
 	// Return the statistics tuple
 	output.SetCardinality(1);
 	output.data[0].SetValue(0, Value(cache_path));                 // cache_path
@@ -236,14 +224,11 @@ static void DiskCacheConfigFunction(ClientContext &context, TableFunctionInput &
 // disk_cache_stats() - Return cache statistics in LRU order with chunking
 static void DiskCacheStatsFunction(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
 	auto &global_state = data.global_state->Cast<DiskCacheGlobalState>();
-
 	// Load data on first call
 	if (global_state.tuples_processed == 0) {
 		auto cache = GetOrCreateDiskCache(*context.db);
-		std::lock_guard<std::mutex> lock(cache->disk_cache_mutex);
 		global_state.stats = cache->GetStatistics();
 	}
-
 	auto &stats = global_state.stats;
 	idx_t offset = global_state.tuples_processed;
 
@@ -255,49 +240,94 @@ static void DiskCacheStatsFunction(ClientContext &context, TableFunctionInput &d
 		output.data[0].SetValue(i, Value(info.protocol));
 		output.data[1].SetValue(i, Value(info.uri));
 		output.data[2].SetValue(i, Value(info.file));
-		output.data[3].SetValue(i, Value::BIGINT(info.range_start_file));
-		output.data[4].SetValue(i, Value::BIGINT(info.range_start_uri));
-		output.data[5].SetValue(i, Value::BIGINT(info.range_size));
-		output.data[6].SetValue(i, Value::BIGINT(info.usage_count));
-		output.data[7].SetValue(i, Value::BIGINT(info.bytes_from_cache));
-		output.data[8].SetValue(i, Value::BIGINT(info.bytes_from_mem));
+		output.data[3].SetValue(i, Value::BIGINT(info.range_start_uri));
+		output.data[4].SetValue(i, Value::BIGINT(info.range_size));
+		output.data[5].SetValue(i, Value::BIGINT(info.usage_count));
+		output.data[6].SetValue(i, Value::BIGINT(info.bytes_from_cache));
+		output.data[7].SetValue(i, Value::BIGINT(info.bytes_from_mem));
 	}
 	global_state.tuples_processed += chunk_size;
 }
 
 //===----------------------------------------------------------------------===//
-// disk_cache_prefetch - Scalar function to prefetch ranges into cache
+// disk_cache_prefetch - Table function to prefetch ranges into cache
 //===----------------------------------------------------------------------===//
 
 struct PrefetchRange {
-	idx_t start;
-	idx_t end;
+	string uri;
+	string key;
+	idx_t lru_rank;      // LRU rank for ordering
+	idx_t start, end;    // range
 	idx_t original_size; // Sum of original range sizes
 };
 
-static void DiskCachePrefetchFunction(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &context = state.GetContext();
-	auto &db = *context.db;
-	auto cache = GetOrCreateDiskCache(db);
+struct DiskCachePrefetchGlobalState : public GlobalTableFunctionState {
+	std::mutex mutex;
+	vector<PrefetchRange> ranges;
+	shared_ptr<DiskCache> cache;
 
-	if (!cache->disk_cache_initialized) {
-		// Cache not initialized - mark all as failed
-		result.SetVectorType(VectorType::CONSTANT_VECTOR);
-		ConstantVector::SetNull(result, true);
-		return;
+	explicit DiskCachePrefetchGlobalState(shared_ptr<DiskCache> cache_p) : cache(std::move(cache_p)) {
 	}
 
-	auto &uri_vec = args.data[0];
-	auto &start_vec = args.data[1];
-	auto &size_vec = args.data[2];
-	auto count = args.size();
+	~DiskCachePrefetchGlobalState() override {
+		if (!cache || ranges.empty()) {
+			return;
+		}
+		// Sort ranges by lru_rank (low to high)
+		std::sort(ranges.begin(), ranges.end(),
+		          [](const PrefetchRange &a, const PrefetchRange &b) { return a.lru_rank < b.lru_rank; });
+		// Issue reads in rank order
+		for (auto &range : ranges) {
+			DiskCacheReadJob job;
+			job.key = range.key;
+			job.uri = range.uri;
+			job.range_start = range.start;
+			job.range_size = range.end - range.start;
+			cache->QueueIORead(job);
+		}
+	}
+
+	idx_t MaxThreads() const override {
+		return 1;
+	}
+};
+
+static unique_ptr<FunctionData> DiskCachePrefetchBind(ClientContext &context, TableFunctionBindInput &input,
+                                                      vector<LogicalType> &return_types, vector<string> &names) {
+	// Return a boolean column indicating success
+	return_types.push_back(LogicalType::BOOLEAN);
+	names.push_back("success");
+	return nullptr;
+}
+
+static unique_ptr<GlobalTableFunctionState> DiskCachePrefetchInitGlobal(ClientContext &context,
+                                                                        TableFunctionInitInput &input) {
+	auto cache = GetOrCreateDiskCache(*context.db);
+	return make_uniq<DiskCachePrefetchGlobalState>(cache);
+}
+
+static OperatorResultType DiskCachePrefetchFunction(ExecutionContext &context, TableFunctionInput &data_p,
+                                                    DataChunk &input, DataChunk &output) {
+	auto &global_state = data_p.global_state->Cast<DiskCachePrefetchGlobalState>();
+
+	if (!global_state.cache || !global_state.cache->disk_cache_initialized) {
+		output.SetCardinality(0);
+		return OperatorResultType::FINISHED;
+	}
+	auto &rank_vec = input.data[0];
+	auto &uri_vec = input.data[1];
+	auto &start_vec = input.data[2];
+	auto &size_vec = input.data[3];
+	auto count = input.size();
 
 	// Flatten vectors to process them
-	UnifiedVectorFormat uri_data, start_data, size_data;
+	UnifiedVectorFormat rank_data, uri_data, start_data, size_data;
+	rank_vec.ToUnifiedFormat(count, rank_data);
 	uri_vec.ToUnifiedFormat(count, uri_data);
 	start_vec.ToUnifiedFormat(count, start_data);
 	size_vec.ToUnifiedFormat(count, size_data);
 
+	auto rank_ptr = UnifiedVectorFormat::GetData<int64_t>(rank_data);
 	auto uri_ptr = UnifiedVectorFormat::GetData<string_t>(uri_data);
 	auto start_ptr = UnifiedVectorFormat::GetData<int64_t>(start_data);
 	auto size_ptr = UnifiedVectorFormat::GetData<int64_t>(size_data);
@@ -306,15 +336,16 @@ static void DiskCachePrefetchFunction(DataChunk &args, ExpressionState &state, V
 	unordered_map<string, vector<PrefetchRange>> ranges_by_file;
 
 	for (idx_t i = 0; i < count; i++) {
+		auto rank_idx = rank_data.sel->get_index(i);
 		auto uri_idx = uri_data.sel->get_index(i);
 		auto start_idx = start_data.sel->get_index(i);
 		auto size_idx = size_data.sel->get_index(i);
 
-		if (!uri_data.validity.RowIsValid(uri_idx) || !start_data.validity.RowIsValid(start_idx) ||
-		    !size_data.validity.RowIsValid(size_idx)) {
+		if (!rank_data.validity.RowIsValid(rank_idx) || !uri_data.validity.RowIsValid(uri_idx) ||
+		    !start_data.validity.RowIsValid(start_idx) || !size_data.validity.RowIsValid(size_idx)) {
 			continue; // Skip null rows
 		}
-
+		idx_t lru_rank = rank_ptr[rank_idx];
 		string uri = uri_ptr[uri_idx].GetString();
 		idx_t range_start = start_ptr[start_idx];
 		idx_t range_size = size_ptr[size_idx];
@@ -322,9 +353,14 @@ static void DiskCachePrefetchFunction(DataChunk &args, ExpressionState &state, V
 		if (range_size == 0) {
 			continue;
 		}
-
 		auto &ranges = ranges_by_file[uri];
-		PrefetchRange new_range = {range_start, range_start + range_size, range_size};
+		PrefetchRange new_range;
+		new_range.uri = uri;
+		new_range.key = global_state.cache->GenCacheKey(uri);
+		new_range.lru_rank = lru_rank;
+		new_range.start = range_start;
+		new_range.end = range_start + range_size;
+		new_range.original_size = range_size;
 
 		// Try to concatenate with the last range
 		if (!ranges.empty()) {
@@ -334,33 +370,31 @@ static void DiskCachePrefetchFunction(DataChunk &args, ExpressionState &state, V
 			// Concatenate if concatenated_size seems cheaper to fetch than the two unconcatenated ranges
 			if (EstimateS3(concatenated_size) < EstimateS3(last.original_size) + EstimateS3(new_range.original_size)) {
 				last.end = new_range.end;
-				last.original_size = last.original_size + new_range.original_size;
-				;
+				last.original_size += new_range.original_size;
+				last.lru_rank = std::min(last.lru_rank, new_range.lru_rank); // Use minimum rank
 				continue;
 			}
 		}
 		ranges.push_back(new_range);
 	}
 
-	// Queue all concatenated ranges as async read jobs for parallel execution
+	// Add all ranges to global state for deferred execution
+	std::lock_guard<std::mutex> lock(global_state.mutex);
 	for (auto &entry : ranges_by_file) {
-		const string &uri = entry.first;
 		auto &ranges = entry.second;
-		string key = cache->GenCacheKey(uri);
-
 		for (auto &range : ranges) {
-			DiskCacheReadJob job;
-			job.key = key;
-			job.uri = uri;
-			job.range_start = range.start;
-			job.range_size = range.end - range.start;
-			cache->QueueIORead(job); // Queue read job to IO threads - will be executed in parallel
+			global_state.ranges.push_back(range);
 		}
 	}
 
-	// Return true for all rows
-	result.SetVectorType(VectorType::CONSTANT_VECTOR);
-	ConstantVector::GetData<bool>(result)[0] = true;
+	// Return TRUE for all input rows
+	output.SetCardinality(count);
+	auto &result_vec = output.data[0];
+	result_vec.SetVectorType(VectorType::CONSTANT_VECTOR);
+	ConstantVector::GetData<bool>(result_vec)[0] = true;
+	ConstantVector::SetNull(result_vec, false);
+
+	return OperatorResultType::NEED_MORE_INPUT;
 }
 
 //===----------------------------------------------------------------------===//
@@ -402,10 +436,11 @@ void DiskCacheExtension::Load(ExtensionLoader &loader) {
 	loader.RegisterFunction(disk_cache_stats_function);
 	DUCKDB_LOG_DEBUG(instance, "[DiskCache] Registered disk_cache_stats function");
 
-	// Register disk_cache_prefetch scalar function
-	ScalarFunction disk_cache_prefetch_function("disk_cache_prefetch",
-	                                            {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT},
-	                                            LogicalType::BOOLEAN, DiskCachePrefetchFunction);
+	// Register disk_cache_prefetch table function (TITO function)
+	TableFunction disk_cache_prefetch_function(
+	    "disk_cache_prefetch", {LogicalType::BIGINT, LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT},
+	    nullptr, DiskCachePrefetchBind, DiskCachePrefetchInitGlobal);
+	disk_cache_prefetch_function.in_out_function = DiskCachePrefetchFunction;
 	loader.RegisterFunction(disk_cache_prefetch_function);
 	DUCKDB_LOG_DEBUG(instance, "[DiskCache] Registered disk_cache_prefetch function");
 

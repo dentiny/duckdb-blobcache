@@ -16,28 +16,28 @@
 #include <thread>
 #include <atomic>
 
-// inspired on AnyBlob paper: lowest latency is 20ms, transfer 12MB/s for the first MB, 40MB/s beyond that
-#define EstimateS3(nr_bytes) ((nr_bytes < (1 << 20)) ? (20 + ((80 * nr_bytes) >> 20)) : (75 + ((25 * nr_bytes) >> 20)))
-
+// inspired on AnyBlob paper: lowest latency is 20ms, transfer 12MB/s for the first MB, increasing to 40MB/s until 8MB
+#define EstimateS3(nr_bytes)                                                                                           \
+	(20 + ((((nr_bytes < (1 << 20)) ? 80 : /* 1000/80 == 12 */                                                         \
+	             (nr_bytes < (1 << 23)) ? (960 / ((nr_bytes >> 18) + 8))                                               \
+	                                    : 24) *                                                                        \
+	        nr_bytes) >>                                                                                               \
+	       20))
 namespace duckdb {
 
 // Forward declarations
 struct DiskCache;
 
-// Write canceled marker for nr_bytes field
-constexpr size_t WRITE_CANCELED = static_cast<size_t>(-1);
+// Canceled marker for nr_bytes field and error return values
+constexpr idx_t CANCELED = static_cast<idx_t>(-1);
 
 // WriteBuffer - shared buffer for async writes
 struct WriteBuffer {
-	char *buf;       // Buffer containing data to write (owned, will be deleted)
-	size_t nr_bytes; // Size to write, or WRITE_CANCELED if canceled
+	std::shared_ptr<char> buf; // Shared pointer to buffer data (with array deleter)
+	size_t nr_bytes;           // Size to write, or WRITE_CANCELED if canceled
+	string file_path;          // Cache file path
 
 	WriteBuffer() : buf(nullptr), nr_bytes(0) {
-	}
-	~WriteBuffer() {
-		if (buf) {
-			delete[] buf;
-		}
 	}
 };
 
@@ -46,21 +46,20 @@ struct WriteBuffer {
 // Each range gets its own file, eliminating the need for DiskCacheFile
 //===----------------------------------------------------------------------===//
 struct DiskCacheFileRange {
-	string file;                                                     // Path to cache file
 	idx_t uri_range_start, uri_range_end;                            // Range in remote blob file (uri)
 	shared_ptr<WriteBuffer> write_buf;                               // Shared write buffer, nullptr when write complete
 	idx_t usage_count = 0, bytes_from_cache = 0, bytes_from_mem = 0; // stats
 	DiskCacheFileRange *lru_prev = nullptr, *lru_next = nullptr;     // LRU doubly-linked list
 
-	DiskCacheFileRange(string file_path, idx_t id, idx_t start, idx_t end, shared_ptr<WriteBuffer> write_buffer)
-	    : file(std::move(file_path)), uri_range_start(start), uri_range_end(end), write_buf(std::move(write_buffer)) {
+	DiskCacheFileRange(idx_t start, idx_t end, shared_ptr<WriteBuffer> write_buffer)
+	    : uri_range_start(start), uri_range_end(end), write_buf(std::move(write_buffer)) {
 	}
 };
 
 struct DiskCacheEntry {
 	string uri; // full URL of the blob
-	// Map of start position to DiskCacheFileRanges (shared for IO thread safety)
-	map<idx_t, shared_ptr<DiskCacheFileRange>> ranges;
+	// Map of start position to DiskCacheFileRanges (unique ownership)
+	map<idx_t, unique_ptr<DiskCacheFileRange>> ranges;
 };
 
 // Statistics structure
@@ -68,7 +67,6 @@ struct DiskCacheRangeInfo {
 	string protocol;        // e.g., s3
 	string uri;             // Blob that we have cached a range of
 	string file;            // Disk file where this range is stored in the cache
-	idx_t range_start_file; // Offset in cache file where this range starts
 	idx_t range_start_uri;  // Start position in blob of this range
 	idx_t range_size;       // Size of range (end - start in remote file)
 	idx_t usage_count;      // how often it was read from the cache
@@ -78,9 +76,8 @@ struct DiskCacheRangeInfo {
 
 // DiskCacheWriteJob - async write job for disk persistence
 struct DiskCacheWriteJob {
-	shared_ptr<WriteBuffer> write_buf;    // Shared write buffer
-	shared_ptr<DiskCacheFileRange> range; // Shared ownership of the range being written
-	string uri, key;                      // For error handling and cache invalidation
+	string uri, key;                   // For error handling and cache invalidation
+	shared_ptr<WriteBuffer> write_buf; // Shared write buffer
 };
 
 // DiskCacheReadJob - async read job for prefetching
@@ -100,8 +97,7 @@ struct DiskCache {
 
 	// Configuration and state
 	shared_ptr<DatabaseInstance> db_instance;
-	bool disk_cache_initialized = false;
-	bool disk_cache_shutting_down = false;
+	bool disk_cache_initialized = false, disk_cache_shutting_down = false;
 	string path_sep;       // normally "/", but "\" on windows
 	string disk_cache_dir; // where we store data temporarily
 	idx_t total_cache_capacity = 0;
@@ -109,15 +105,16 @@ struct DiskCache {
 	// Memory cache for disk-cached files (our own ExternalFileCache instance)
 	unique_ptr<ExternalFileCache> blobfile_memcache;
 
-	// Directory management
+	// Dir mgmt: rather than checking the FileSystem for existence on each write, remember what we created already
 	mutable std::mutex subdir_mutex;
-	std::bitset<4096 + 4096 * 256> subdir_created; // 4096*256 (XXX/YY directories)
+	std::bitset<4096 + 4096 * 256> subdir_created; // 4096 XXX/ directories plus 4096*256 XXX/YY directories
 
 	// Cache maps and LRU
-	mutable std::mutex disk_cache_mutex; // Protects cache, LRU lists, sizes
-	unique_ptr<unordered_map<string, unique_ptr<DiskCacheEntry>>> key_cache;
-	DiskCacheFileRange *lru_head = nullptr, *lru_tail = nullptr; // Range-based LRU
+	mutable std::mutex disk_cache_mutex;                                     // Protects cache, LRU lists, sizes
+	unique_ptr<unordered_map<string, unique_ptr<DiskCacheEntry>>> key_cache; // 1 entry per file (+rangelist per entry)
+	DiskCacheFileRange *lru_head = nullptr, *lru_tail = nullptr;             // LRU on the ranges (not on the files)
 	idx_t current_cache_size = 0, nr_ranges = 0, current_file_id = 10000000;
+	idx_t memcache_size = 0; // Track size of data in our memcache
 
 	// Cached regex patterns for file filtering
 	mutable std::mutex regex_mutex;
@@ -156,11 +153,6 @@ struct DiskCache {
 		if (db_instance && !disk_cache_shutting_down) {
 			DUCKDB_LOG_ERROR(*db_instance, "[DiskCache] %s", message.c_str());
 		}
-	}
-
-	// File system helpers
-	FileSystem &GetFileSystem() const {
-		return FileSystem::GetFileSystem(*db_instance);
 	}
 
 	// Cache key and file path generation
@@ -207,14 +199,18 @@ struct DiskCache {
 		key_cache->clear();
 		lru_head = lru_tail = nullptr;
 		current_cache_size = nr_ranges = 0;
+		if (blobfile_memcache) {
+			blobfile_memcache = make_uniq<ExternalFileCache>(*db_instance, true);
+		}
+		memcache_size = 0;
 	}
 
-	DiskCacheEntry *FindFile(const string &key, const string &uri) {
+	DiskCacheEntry *FindEntry(const string &key, const string &uri) {
 		auto it = key_cache->find(key);
 		return (it != key_cache->end() && it->second->uri == uri) ? it->second.get() : nullptr;
 	}
 
-	DiskCacheEntry *UpsertFile(const string &key, const string &uri) {
+	DiskCacheEntry *UpsertEntry(const string &key, const string &uri) {
 		DiskCacheEntry *cache_entry = nullptr;
 		auto it = key_cache->find(key);
 		if (it == key_cache->end()) {
@@ -228,17 +224,18 @@ struct DiskCache {
 		}
 		return cache_entry;
 	}
-
-	void EvictFile(const string &uri) {
-		if (!disk_cache_initialized) {
-			return;
+	void EvictEntry(const string &uri, const string &key);
+	void EvictRange(DiskCacheFileRange *range) {
+		auto buf = range->write_buf->buf;
+		if (buf) {
+			range->write_buf->nr_bytes = CANCELED; // Write is ongoing, cancel it
+		} else {
+			DeleteCacheFile(range->write_buf->file_path); // Write completed, delete the file
 		}
-		std::lock_guard<std::mutex> lock(disk_cache_mutex);
-		string key = GenCacheKey(uri);
-		EvictCache(uri, key);
+		RemoveFromLRU(range); // Remove from LRU
+		current_cache_size -= std::min<idx_t>(current_cache_size, range->uri_range_end - range->uri_range_start);
+		nr_ranges--;
 	}
-
-	void EvictCache(const string &uri, const string &key);
 
 	// LRU management
 	void TouchLRU(DiskCacheFileRange *range) {
@@ -276,8 +273,8 @@ struct DiskCache {
 	// File operations
 	bool EvictToCapacity(idx_t required_space);
 	unique_ptr<FileHandle> TryOpenCacheFile(const string &file_path);
-	bool WriteToCacheFile(const string &file_path, const void *buffer, idx_t length);
-	bool ReadFromCacheFile(const string &file_path, void *buffer, idx_t &length, idx_t &out_bytes_from_mem);
+	bool WriteToCacheFile(const string &file_path, const void *buf, idx_t len);
+	idx_t ReadFromCacheFile(const string &file_path, void *buf, idx_t len, idx_t offset); // Returns bytes_from_mem
 	bool DeleteCacheFile(const string &file_path);
 	vector<DiskCacheRangeInfo> GetStatistics() const;
 

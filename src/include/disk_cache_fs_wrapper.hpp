@@ -20,19 +20,14 @@ class BlobFileHandle;
 class DiskCacheObjectCacheEntry : public ObjectCacheEntry {
 public:
 	shared_ptr<DiskCache> cache;
-
 	explicit DiskCacheObjectCacheEntry(shared_ptr<DiskCache> cache_p) : cache(std::move(cache_p)) {
 	}
-
 	string GetObjectType() override {
 		return "DiskCache";
 	}
-
 	static string ObjectType() {
 		return "DiskCache";
 	}
-
-	// ObjectCacheEntry is properly destructed automatically
 	~DiskCacheObjectCacheEntry() override = default;
 };
 
@@ -47,9 +42,7 @@ public:
 	      wrapped_handle(std::move(wrapped_handle)), cache(cache), uri(std::move(original_path)), key(std::move(key)),
 	      file_position(0) {
 	}
-
 	~BlobFileHandle() override = default;
-
 	void Close() override {
 		if (wrapped_handle) {
 			wrapped_handle->Close();
@@ -93,23 +86,72 @@ public:
 	void Read(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) override;
 	int64_t Read(FileHandle &handle, void *buffer, int64_t nr_bytes) override;
 
-	// write ops just wrap but also invalidate the file from the cache
+	// write ops just wrap but also invalidate the file from the cache -- worked out in cpp file
 	void Write(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) override;
 	int64_t Write(FileHandle &handle, void *buffer, int64_t nr_bytes) override;
-	void Truncate(FileHandle &handle, int64_t new_size) override;
-	void MoveFile(const string &source, const string &target, optional_ptr<FileOpener> opener = nullptr) override;
-	void RemoveFile(const string &uri, optional_ptr<FileOpener> opener = nullptr) override;
+
+	// write operations should invalidate the cache
+	void MoveFile(const string &source, const string &target, optional_ptr<FileOpener> opener) override {
+		if (cache) {
+			cache->EvictEntry(source, cache->GenCacheKey(source));
+			cache->EvictEntry(target, cache->GenCacheKey(target));
+		}
+		wrapped_fs->MoveFile(source, target, opener);
+	}
+	void RemoveFile(const string &uri, optional_ptr<FileOpener> opener) override {
+		if (cache) {
+			cache->EvictEntry(uri, cache->GenCacheKey(uri));
+		}
+		wrapped_fs->RemoveFile(uri, opener);
+	}
 	bool TryRemoveFile(const string &uri, optional_ptr<FileOpener> opener = nullptr) override {
 		if (cache) {
-			cache->EvictFile(uri);
+			cache->EvictEntry(uri, cache->GenCacheKey(uri));
 		}
 		return wrapped_fs->TryRemoveFile(uri, opener);
 	}
+	// these two are not expected to be implemented in blob filesystems, but for completeness/safety they evict as well
+	void Truncate(FileHandle &handle, int64_t new_size) override {
+		auto &blob_handle = handle.Cast<BlobFileHandle>();
+		if (blob_handle.cache) {
+			blob_handle.cache->EvictEntry(blob_handle.uri, blob_handle.key);
+		}
+		wrapped_fs->Truncate(*blob_handle.wrapped_handle, new_size);
+	}
 	bool Trim(FileHandle &handle, idx_t offset_bytes, idx_t length_bytes) override {
 		auto &blob_handle = handle.Cast<BlobFileHandle>();
+		if (cache) {
+			cache->EvictEntry(blob_handle.uri, blob_handle.key);
+		}
 		return wrapped_fs->Trim(*blob_handle.wrapped_handle, offset_bytes, length_bytes);
 	}
 
+	// we give the FS a wrapped name
+	string GetName() const override {
+		return "DiskCache:" + wrapped_fs->GetName();
+	}
+
+	// we keep track of the seek position
+	void Seek(FileHandle &handle, idx_t location) override {
+		auto &blob_handle = handle.Cast<BlobFileHandle>();
+		blob_handle.file_position = location;
+		if (blob_handle.wrapped_handle) {
+			wrapped_fs->Seek(*blob_handle.wrapped_handle, location);
+		}
+	}
+	void Reset(FileHandle &handle) override {
+		auto &blob_handle = handle.Cast<BlobFileHandle>();
+		blob_handle.file_position = 0;
+		if (blob_handle.wrapped_handle) {
+			wrapped_fs->Reset(*blob_handle.wrapped_handle);
+		}
+	}
+	idx_t SeekPosition(FileHandle &handle) override {
+		auto &blob_handle = handle.Cast<BlobFileHandle>();
+		return blob_handle.file_position;
+	}
+
+	// simple pass-through wrappers around all other methods
 	int64_t GetFileSize(FileHandle &handle) override {
 		auto &blob_handle = handle.Cast<BlobFileHandle>();
 		return wrapped_fs->GetFileSize(*blob_handle.wrapped_handle);
@@ -129,24 +171,6 @@ public:
 	void FileSync(FileHandle &handle) override {
 		auto &blob_handle = handle.Cast<BlobFileHandle>();
 		wrapped_fs->FileSync(*blob_handle.wrapped_handle);
-	}
-	void Seek(FileHandle &handle, idx_t location) override {
-		auto &blob_handle = handle.Cast<BlobFileHandle>();
-		blob_handle.file_position = location;
-		if (blob_handle.wrapped_handle) {
-			wrapped_fs->Seek(*blob_handle.wrapped_handle, location);
-		}
-	}
-	void Reset(FileHandle &handle) override {
-		auto &blob_handle = handle.Cast<BlobFileHandle>();
-		blob_handle.file_position = 0;
-		if (blob_handle.wrapped_handle) {
-			wrapped_fs->Reset(*blob_handle.wrapped_handle);
-		}
-	}
-	idx_t SeekPosition(FileHandle &handle) override {
-		auto &blob_handle = handle.Cast<BlobFileHandle>();
-		return blob_handle.file_position;
 	}
 	bool CanSeek() override {
 		return wrapped_fs->CanSeek();
@@ -198,9 +222,6 @@ public:
 	bool CanHandleFile(const string &fpath) override {
 		return wrapped_fs->CanHandleFile(fpath);
 	}
-	string GetName() const override {
-		return "DiskCache:" + wrapped_fs->GetName();
-	}
 	string PathSeparator(const string &path) override {
 		return wrapped_fs->PathSeparator(path);
 	}
@@ -235,9 +256,6 @@ public:
 	}
 	~FakeS3FileSystem() override = default;
 
-	bool CanHandleFile(const string &fpath) override {
-		return BlobFilesystemWrapper::IsFakeS3(fpath); // Override to claim we can handle fake_s3:// URLs
-	}
 	bool OnDiskFile(FileHandle &handle) override {
 		return false; // the point of this fake fs is to pretend it is S3, ie a non-disk fs
 	}
@@ -247,32 +265,41 @@ public:
 	// Override all methods manipulating paths to strip/add the fake_s3:// path prefix
 	unique_ptr<FileHandle> OpenFile(const string &uri, FileOpenFlags flags,
 	                                optional_ptr<FileOpener> opener = nullptr) override {
-		return LocalFileSystem::OpenFile(Stripfake_s3Prefix(uri), flags, opener);
+		return LocalFileSystem::OpenFile(StripFakeS3Prefix(uri), flags, opener);
 	}
 	bool FileExists(const string &uri, optional_ptr<FileOpener> opener = nullptr) override {
-		return LocalFileSystem::FileExists(Stripfake_s3Prefix(uri), opener);
+		return LocalFileSystem::FileExists(StripFakeS3Prefix(uri), opener);
 	}
 	bool DirectoryExists(const string &directory, optional_ptr<FileOpener> opener = nullptr) override {
-		return LocalFileSystem::DirectoryExists(Stripfake_s3Prefix(directory), opener);
+		return LocalFileSystem::DirectoryExists(StripFakeS3Prefix(directory), opener);
 	}
 	void CreateDirectory(const string &directory, optional_ptr<FileOpener> opener = nullptr) override {
-		LocalFileSystem::CreateDirectory(Stripfake_s3Prefix(directory), opener);
+		LocalFileSystem::CreateDirectory(StripFakeS3Prefix(directory), opener);
 	}
 	void CreateDirectoriesRecursive(const string &path, optional_ptr<FileOpener> opener = nullptr) override {
-		LocalFileSystem::CreateDirectoriesRecursive(Stripfake_s3Prefix(path), opener);
+		LocalFileSystem::CreateDirectoriesRecursive(StripFakeS3Prefix(path), opener);
 	}
 	void RemoveDirectory(const string &directory, optional_ptr<FileOpener> opener = nullptr) override {
-		LocalFileSystem::RemoveDirectory(Stripfake_s3Prefix(directory), opener);
+		LocalFileSystem::RemoveDirectory(StripFakeS3Prefix(directory), opener);
 	}
 	bool ListFiles(const string &directory, const std::function<void(const string &, bool)> &callback,
 	               FileOpener *opener = nullptr) override {
 		auto wrapped_callback = [&callback](const string &path, bool is_directory) {
 			callback("fake_s3://" + path, is_directory); // Pretend the paths start with fake_s3://
 		};
-		return LocalFileSystem::ListFiles(Stripfake_s3Prefix(directory), wrapped_callback, opener);
+		return LocalFileSystem::ListFiles(StripFakeS3Prefix(directory), wrapped_callback, opener);
+	}
+	bool TryRemoveFile(const string &uri, optional_ptr<FileOpener> opener = nullptr) override {
+		return LocalFileSystem::TryRemoveFile(StripFakeS3Prefix(uri), opener);
+	}
+	bool CanHandleFile(const string &fpath) override {
+		return BlobFilesystemWrapper::IsFakeS3(fpath);
+	}
+	string ExpandPath(const string &path) override {
+		return "fake_s3://" + LocalFileSystem::ExpandPath(StripFakeS3Prefix(path));
 	}
 	vector<OpenFileInfo> Glob(const string &uri, FileOpener *opener = nullptr) override {
-		auto results = LocalFileSystem::Glob(Stripfake_s3Prefix(uri), opener);
+		auto results = LocalFileSystem::Glob(StripFakeS3Prefix(uri), opener);
 		for (auto &info : results) {
 			info.path = "fake_s3://" + info.path; // Pretend the paths start with fake_s3://
 		}
@@ -280,7 +307,7 @@ public:
 	}
 
 private:
-	string Stripfake_s3Prefix(const string &uri) {
+	string StripFakeS3Prefix(const string &uri) {
 		return BlobFilesystemWrapper::IsFakeS3(uri) ? uri.substr(10) : uri;
 	}
 };
