@@ -1,0 +1,66 @@
+# name: test/sql/duck_lake.test
+# description: test disk_cache extension
+# group: [sql]
+
+require parquet
+
+require disk_cache
+
+statement ok
+install httpfs
+
+statement ok
+load httpfs
+
+# take ducklake for a spin
+statement ok
+install ducklake
+
+statement ok
+load ducklake
+
+statement ok
+set enable_external_file_cache = false;
+
+statement ok
+ATTACH 'ducklake:fake_s3://network.ducklake' AS my_ducklake;
+
+statement ok
+create or replace table my_ducklake.tst as (from range(1000000));
+
+statement ok
+select max(range) from my_ducklake.tst;
+
+# we should get caching
+query III
+select count(*), sum(usage_count), sum(bytes_from_mem) from disk_cache_stats() where uri like '%.parquet';
+----
+19	19	4003855
+
+statement ok
+select max(range) from my_ducklake.tst;
+
+# we should get more caching
+query III
+select count(*), sum(usage_count), sum(bytes_from_mem) from disk_cache_stats() where uri like '%.parquet';
+----
+19	38	8007710
+
+statement ok
+set enable_external_file_cache = true;
+
+statement ok
+select max(range) from my_ducklake.tst;
+
+query III
+select count(*), sum(usage_count), sum(bytes_from_mem) from disk_cache_stats() where uri like '%.parquet';
+----
+19	57	8007710
+
+statement ok
+select max(range) from my_ducklake.tst;
+
+query III
+select count(*), sum(usage_count), sum(bytes_from_mem) from disk_cache_stats() where uri like '%.parquet';
+----
+19	57	8007710
