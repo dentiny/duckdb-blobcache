@@ -67,8 +67,8 @@ public:
 	virtual ~BlobFilesystemWrapper() = default;
 
 	static bool IsFakeS3(const string &path) {
-		auto prefix = StringUtil::Lower(path.substr(0, 10)) ;
-		return (prefix == "fake_s3://") || (prefix == "fake_s3:\\\\");
+		auto prefix = StringUtil::Lower(path.substr(0, 7));
+		return (prefix == "fake_s3");
 	}
 
 protected:
@@ -309,7 +309,11 @@ public:
 
 private:
 	string StripFakeS3Prefix(const string &uri) {
-		return BlobFilesystemWrapper::IsFakeS3(uri) ? uri.substr(10) : uri;
+		if (!BlobFilesystemWrapper::IsFakeS3(uri)) return uri;
+		idx_t i = 0; // Windows CI failing makes one write this code
+		while ((uri[i] != '/' && uri[i] != '\\') && (i++ < uri.size()));
+		while ((uri[i] == '/' || uri[i] == '\\') && (i++ < uri.size()));
+		return uri.substr(i);
 	}
 };
 
