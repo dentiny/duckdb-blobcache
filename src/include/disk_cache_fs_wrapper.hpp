@@ -12,7 +12,7 @@ namespace duckdb {
 
 // Forward declarations
 struct DiskCache;
-class BlobFileHandle;
+class DiskCacheFileHandle;
 
 //===----------------------------------------------------------------------===//
 // DiskCacheObjectCacheEntry - ObjectCache wrapper for DiskCache
@@ -32,17 +32,17 @@ public:
 };
 
 //===----------------------------------------------------------------------===//
-// BlobFileHandle - wraps original file handles to intercept reads
+// DiskCacheFileHandle - wraps original file handles to intercept reads
 //===----------------------------------------------------------------------===//
-class BlobFileHandle : public FileHandle {
+class DiskCacheFileHandle : public FileHandle {
 public:
-	BlobFileHandle(FileSystem &fs, string original_path, unique_ptr<FileHandle> wrapped_handle, string key,
-	               shared_ptr<DiskCache> cache)
+	DiskCacheFileHandle(FileSystem &fs, string original_path, unique_ptr<FileHandle> wrapped_handle, string key,
+	                    shared_ptr<DiskCache> cache)
 	    : FileHandle(fs, wrapped_handle->GetPath(), wrapped_handle->GetFlags()),
 	      wrapped_handle(std::move(wrapped_handle)), cache(cache), uri(std::move(original_path)), key(std::move(key)),
 	      file_position(0) {
 	}
-	~BlobFileHandle() override = default;
+	~DiskCacheFileHandle() override = default;
 	void Close() override {
 		if (wrapped_handle) {
 			wrapped_handle->Close();
@@ -57,14 +57,14 @@ public:
 };
 
 //===----------------------------------------------------------------------===//
-// BlobFilesystemWrapper - wraps the original blob filesystems with caching
+// DiskCacheFileSystemWrapper - wraps the original blob filesystems with caching
 //===----------------------------------------------------------------------===//
-class BlobFilesystemWrapper : public FileSystem {
+class DiskCacheFileSystemWrapper : public FileSystem {
 public:
-	explicit BlobFilesystemWrapper(unique_ptr<FileSystem> wrapped_fs, shared_ptr<DiskCache> shared_cache)
+	explicit DiskCacheFileSystemWrapper(unique_ptr<FileSystem> wrapped_fs, shared_ptr<DiskCache> shared_cache)
 	    : wrapped_fs(std::move(wrapped_fs)), cache(shared_cache) {
 	}
-	virtual ~BlobFilesystemWrapper() = default;
+	virtual ~DiskCacheFileSystemWrapper() = default;
 
 	static bool IsFakeS3(const string &path) {
 		auto prefix = StringUtil::Lower(path.substr(0, 7));
@@ -113,14 +113,14 @@ public:
 	}
 	// these two are not expected to be implemented in blob filesystems, but for completeness/safety they evict as well
 	void Truncate(FileHandle &handle, int64_t new_size) override {
-		auto &blob_handle = handle.Cast<BlobFileHandle>();
+		auto &blob_handle = handle.Cast<DiskCacheFileHandle>();
 		if (blob_handle.cache) {
 			blob_handle.cache->EvictEntry(blob_handle.uri, blob_handle.key);
 		}
 		wrapped_fs->Truncate(*blob_handle.wrapped_handle, new_size);
 	}
 	bool Trim(FileHandle &handle, idx_t offset_bytes, idx_t length_bytes) override {
-		auto &blob_handle = handle.Cast<BlobFileHandle>();
+		auto &blob_handle = handle.Cast<DiskCacheFileHandle>();
 		if (cache) {
 			cache->EvictEntry(blob_handle.uri, blob_handle.key);
 		}
@@ -134,50 +134,50 @@ public:
 
 	// we keep track of the seek position
 	void Seek(FileHandle &handle, idx_t location) override {
-		auto &blob_handle = handle.Cast<BlobFileHandle>();
+		auto &blob_handle = handle.Cast<DiskCacheFileHandle>();
 		blob_handle.file_position = location;
 		if (blob_handle.wrapped_handle) {
 			wrapped_fs->Seek(*blob_handle.wrapped_handle, location);
 		}
 	}
 	void Reset(FileHandle &handle) override {
-		auto &blob_handle = handle.Cast<BlobFileHandle>();
+		auto &blob_handle = handle.Cast<DiskCacheFileHandle>();
 		blob_handle.file_position = 0;
 		if (blob_handle.wrapped_handle) {
 			wrapped_fs->Reset(*blob_handle.wrapped_handle);
 		}
 	}
 	idx_t SeekPosition(FileHandle &handle) override {
-		auto &blob_handle = handle.Cast<BlobFileHandle>();
+		auto &blob_handle = handle.Cast<DiskCacheFileHandle>();
 		return blob_handle.file_position;
 	}
 
 	// simple pass-through wrappers around all other methods
 	int64_t GetFileSize(FileHandle &handle) override {
-		auto &blob_handle = handle.Cast<BlobFileHandle>();
+		auto &blob_handle = handle.Cast<DiskCacheFileHandle>();
 		return wrapped_fs->GetFileSize(*blob_handle.wrapped_handle);
 	}
 	timestamp_t GetLastModifiedTime(FileHandle &handle) override {
-		auto &blob_handle = handle.Cast<BlobFileHandle>();
+		auto &blob_handle = handle.Cast<DiskCacheFileHandle>();
 		return wrapped_fs->GetLastModifiedTime(*blob_handle.wrapped_handle);
 	}
 	string GetVersionTag(FileHandle &handle) override {
-		auto &blob_handle = handle.Cast<BlobFileHandle>();
+		auto &blob_handle = handle.Cast<DiskCacheFileHandle>();
 		return wrapped_fs->GetVersionTag(*blob_handle.wrapped_handle);
 	}
 	FileType GetFileType(FileHandle &handle) override {
-		auto &blob_handle = handle.Cast<BlobFileHandle>();
+		auto &blob_handle = handle.Cast<DiskCacheFileHandle>();
 		return wrapped_fs->GetFileType(*blob_handle.wrapped_handle);
 	}
 	void FileSync(FileHandle &handle) override {
-		auto &blob_handle = handle.Cast<BlobFileHandle>();
+		auto &blob_handle = handle.Cast<DiskCacheFileHandle>();
 		wrapped_fs->FileSync(*blob_handle.wrapped_handle);
 	}
 	bool CanSeek() override {
 		return wrapped_fs->CanSeek();
 	}
 	bool OnDiskFile(FileHandle &handle) override {
-		auto &blob_handle = handle.Cast<BlobFileHandle>();
+		auto &blob_handle = handle.Cast<DiskCacheFileHandle>();
 		return wrapped_fs->OnDiskFile(*blob_handle.wrapped_handle);
 	}
 	bool DirectoryExists(const string &directory, optional_ptr<FileOpener> opener = nullptr) override {
@@ -275,7 +275,11 @@ public:
 		return LocalFileSystem::DirectoryExists(StripFakeS3Prefix(directory), opener);
 	}
 	void CreateDirectory(const string &directory, optional_ptr<FileOpener> opener = nullptr) override {
-		LocalFileSystem::CreateDirectory(StripFakeS3Prefix(directory), opener);
+		// DuckDB's IsRemoteFile() is hardcoded and fails to recognize fake_s3://
+		// DuckLakeInsert::GetCopyOptions somehow invokes LocalFilesystem:CreateDirectoriesRecursive
+		// rather than the proper filesystem, which fails.
+		// The below instruction to create recursively seems to mitigate these issues.
+		LocalFileSystem::CreateDirectoriesRecursive(StripFakeS3Prefix(directory), opener);
 	}
 	void CreateDirectoriesRecursive(const string &path, optional_ptr<FileOpener> opener = nullptr) override {
 		LocalFileSystem::CreateDirectoriesRecursive(StripFakeS3Prefix(path), opener);
@@ -294,7 +298,7 @@ public:
 		return LocalFileSystem::TryRemoveFile(StripFakeS3Prefix(uri), opener);
 	}
 	bool CanHandleFile(const string &fpath) override {
-		return BlobFilesystemWrapper::IsFakeS3(fpath);
+		return DiskCacheFileSystemWrapper::IsFakeS3(fpath);
 	}
 	string ExpandPath(const string &path) override {
 		return "fake_s3://" + LocalFileSystem::ExpandPath(StripFakeS3Prefix(path));
@@ -309,10 +313,13 @@ public:
 
 private:
 	string StripFakeS3Prefix(const string &uri) {
-		if (!BlobFilesystemWrapper::IsFakeS3(uri)) return uri;
+		if (!DiskCacheFileSystemWrapper::IsFakeS3(uri))
+			return uri;
 		idx_t i = 0; // Windows CI failing makes one write this code
-		while ((uri[i] != '/' && uri[i] != '\\') && (i++ < uri.size()));
-		while ((uri[i] == '/' || uri[i] == '\\') && (i++ < uri.size()));
+		while ((uri[i] != '/' && uri[i] != '\\') && (i++ < uri.size()))
+			;
+		while ((uri[i] == '/' || uri[i] == '\\') && (i++ < uri.size()))
+			;
 		return uri.substr(i);
 	}
 };

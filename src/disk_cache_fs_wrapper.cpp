@@ -4,11 +4,11 @@
 namespace duckdb {
 
 //===----------------------------------------------------------------------===//
-// BlobFilesystemWrapper Implementation
+// DiskCacheFileSystemWrapper Implementation
 //===----------------------------------------------------------------------===//
 
-unique_ptr<FileHandle> BlobFilesystemWrapper::OpenFileExtended(const OpenFileInfo &info, FileOpenFlags flags,
-                                                               optional_ptr<FileOpener> opener) {
+unique_ptr<FileHandle> DiskCacheFileSystemWrapper::OpenFileExtended(const OpenFileInfo &info, FileOpenFlags flags,
+                                                                    optional_ptr<FileOpener> opener) {
 	auto wrapped_handle = wrapped_fs->OpenFile(info.path, flags, opener);
 	if (!wrapped_handle || (!IsFakeS3(info.path) && wrapped_fs->OnDiskFile(*wrapped_handle))) {
 		return wrapped_handle; // Never cache file:// URLs as they are already local
@@ -26,10 +26,11 @@ unique_ptr<FileHandle> BlobFilesystemWrapper::OpenFileExtended(const OpenFileInf
 		return wrapped_handle; // don't cache, return a normal handle
 	}
 	auto key = cache->GenCacheKey(info.path);
-	return make_uniq<BlobFileHandle>(*this, info.path, std::move(wrapped_handle), key, cache);
+	return make_uniq<DiskCacheFileHandle>(*this, info.path, std::move(wrapped_handle), key, cache);
 }
 
-static idx_t ReadChunk(duckdb::FileSystem &wrapped_fs, BlobFileHandle &handle, char *buf, idx_t location, idx_t len) {
+static idx_t ReadChunk(duckdb::FileSystem &wrapped_fs, DiskCacheFileHandle &handle, char *buf, idx_t location,
+                       idx_t len) {
 	// NOTE: ReadFromCache() can return cached_bytes == 0 but adjust max_nr_bytes downwards to align with a cached range
 	handle.cache->LogDebug("ReadChunk(path=" + handle.uri + ", location=" + to_string(location) +
 	                       ", max_nr_bytes=" + to_string(len) + ")");
@@ -54,7 +55,7 @@ static idx_t ReadChunk(duckdb::FileSystem &wrapped_fs, BlobFileHandle &handle, c
 
 		handle.cache->InsertCache(handle.key, handle.uri, location + nr_cached, nr_read, buf + nr_cached);
 
-		if (nr_read && BlobFilesystemWrapper::IsFakeS3(handle.uri)) {
+		if (nr_read && DiskCacheFileSystemWrapper::IsFakeS3(handle.uri)) {
 			std::this_thread::sleep_for(std::chrono::milliseconds(EstimateS3(nr_read))); // simulate S3 latency
 		}
 	}
@@ -62,8 +63,8 @@ static idx_t ReadChunk(duckdb::FileSystem &wrapped_fs, BlobFileHandle &handle, c
 	return len;
 }
 
-void BlobFilesystemWrapper::Read(FileHandle &handle, void *buf, int64_t nr_bytes, idx_t location) {
-	auto &blob_handle = handle.Cast<BlobFileHandle>();
+void DiskCacheFileSystemWrapper::Read(FileHandle &handle, void *buf, int64_t nr_bytes, idx_t location) {
+	auto &blob_handle = handle.Cast<DiskCacheFileHandle>();
 	if (!blob_handle.cache || !cache->disk_cache_initialized) {
 		wrapped_fs->Read(*blob_handle.wrapped_handle, buf, nr_bytes, location);
 		return; // a read that cannot cache
@@ -79,16 +80,16 @@ void BlobFilesystemWrapper::Read(FileHandle &handle, void *buf, int64_t nr_bytes
 	} while (nr_bytes > 0 && chunk_bytes > 0); //  not done reading and not EOF
 }
 
-int64_t BlobFilesystemWrapper::Read(FileHandle &handle, void *buf, int64_t nr_bytes) {
-	auto &blob_handle = handle.Cast<BlobFileHandle>();
+int64_t DiskCacheFileSystemWrapper::Read(FileHandle &handle, void *buf, int64_t nr_bytes) {
+	auto &blob_handle = handle.Cast<DiskCacheFileHandle>();
 	if (!blob_handle.cache || !cache->disk_cache_initialized) {
 		return wrapped_fs->Read(*blob_handle.wrapped_handle, buf, nr_bytes);
 	}
 	return ReadChunk(*wrapped_fs, blob_handle, static_cast<char *>(buf), blob_handle.file_position, nr_bytes);
 }
 
-void BlobFilesystemWrapper::Write(FileHandle &handle, void *buf, int64_t nr_bytes, idx_t location) {
-	auto &blob_handle = handle.Cast<BlobFileHandle>();
+void DiskCacheFileSystemWrapper::Write(FileHandle &handle, void *buf, int64_t nr_bytes, idx_t location) {
+	auto &blob_handle = handle.Cast<DiskCacheFileHandle>();
 	wrapped_fs->Write(*blob_handle.wrapped_handle, buf, nr_bytes, location);
 	blob_handle.file_position = location + nr_bytes;
 
@@ -98,8 +99,8 @@ void BlobFilesystemWrapper::Write(FileHandle &handle, void *buf, int64_t nr_byte
 	}
 }
 
-int64_t BlobFilesystemWrapper::Write(FileHandle &handle, void *buf, int64_t nr_bytes) {
-	auto &blob_handle = handle.Cast<BlobFileHandle>();
+int64_t DiskCacheFileSystemWrapper::Write(FileHandle &handle, void *buf, int64_t nr_bytes) {
+	auto &blob_handle = handle.Cast<DiskCacheFileHandle>();
 	idx_t write_location = blob_handle.file_position;
 	nr_bytes = wrapped_fs->Write(*blob_handle.wrapped_handle, buf, nr_bytes);
 	if (nr_bytes > 0) {
@@ -196,7 +197,7 @@ void WrapExistingFilesystems(DatabaseInstance &instance) {
 		if (extracted_fs) {
 			DUCKDB_LOG_DEBUG(instance, "[DiskCache] Successfully extracted subsystem: '%s' (GetName returns: '%s')",
 			                 name.c_str(), extracted_fs->GetName().c_str());
-			auto wrapped_fs = make_uniq<BlobFilesystemWrapper>(std::move(extracted_fs), shared_cache);
+			auto wrapped_fs = make_uniq<DiskCacheFileSystemWrapper>(std::move(extracted_fs), shared_cache);
 			DUCKDB_LOG_DEBUG(instance, "[DiskCache] Created wrapper with name: '%s'", wrapped_fs->GetName().c_str());
 			vfs->RegisterSubSystem(std::move(wrapped_fs));
 			DUCKDB_LOG_DEBUG(instance, "[DiskCache] Successfully registered wrapped subsystem for '%s'", name.c_str());
@@ -207,7 +208,7 @@ void WrapExistingFilesystems(DatabaseInstance &instance) {
 	if (!fake_s3_seen) { // Register fakes3:// filesystem for testing purposes - wrapped with caching
 		DUCKDB_LOG_DEBUG(instance, "[DiskCache] Registering fake_s3:// filesystem for testing");
 		auto fake_s3_fs = make_uniq<FakeS3FileSystem>();
-		auto wrapped_fake_s3_fs = make_uniq<BlobFilesystemWrapper>(std::move(fake_s3_fs), shared_cache);
+		auto wrapped_fake_s3_fs = make_uniq<DiskCacheFileSystemWrapper>(std::move(fake_s3_fs), shared_cache);
 		vfs->RegisterSubSystem(std::move(wrapped_fake_s3_fs));
 	}
 
