@@ -278,7 +278,10 @@ public:
 		// DuckLakeInsert::GetCopyOptions somehow invokes LocalFilesystem:CreateDirectoriesRecursive
 		// rather than the proper filesystem, which fails.
 		// The below instruction to create recursively seems to mitigate these issues.
-		LocalFileSystem::CreateDirectoriesRecursive(StripFakeS3Prefix(directory), opener);
+		if (DiskCacheFileSystemWrapper::IsFakeS3(directory)) {
+			LocalFileSystem::CreateDirectoriesRecursive(StripFakeS3Prefix(directory), opener);
+		}
+		LocalFileSystem::CreateDirectory(directory, opener);
 	}
 	void CreateDirectoriesRecursive(const string &path, optional_ptr<FileOpener> opener = nullptr) override {
 		LocalFileSystem::CreateDirectoriesRecursive(StripFakeS3Prefix(path), opener);
@@ -312,7 +315,7 @@ public:
 
 private:
 	string StripFakeS3Prefix(const string &uri) {
-		return DiskCacheFileSystemWrapper::IsFakeS3(uri) ? uri.substr(10) : uri;
+		return DiskCacheFileSystemWrapper::IsFakeS3(uri) ? std::move(uri.substr(10)) : uri;
 	}
 };
 
