@@ -265,7 +265,17 @@ public:
 	// Override all methods manipulating paths to strip/add the fake_s3:// path prefix
 	unique_ptr<FileHandle> OpenFile(const string &uri, FileOpenFlags flags,
 	                                optional_ptr<FileOpener> opener = nullptr) override {
-		return LocalFileSystem::OpenFile(StripFakeS3Prefix(uri), flags, opener);
+		if (DiskCacheFileSystemWrapper::IsFakeS3(uri)) {
+			uri = StripFakeS3Prefix(uri);
+			// S3 can write to a path without creating 'directories' first - so FakeS3 can also
+			if (flags & (FileOpenFlags::FILE_FLAGS_FILE_CREATE | FileOpenFlags::FILE_FLAGS_FILE_CREATE_NEW)) {
+				auto last_slash = uri.rfind('/'); // what about windoze??
+				if (last_slash != std::string::npos) {
+					LocalFileSystem::CreateDirectoriesRecursive(uri.substr(0, last_slash), opener);
+				}
+			}
+		}
+		return LocalFileSystem::OpenFile(uri, flags, opener);
 	}
 	bool FileExists(const string &uri, optional_ptr<FileOpener> opener = nullptr) override {
 		return LocalFileSystem::FileExists(StripFakeS3Prefix(uri), opener);
@@ -274,13 +284,13 @@ public:
 		return LocalFileSystem::DirectoryExists(StripFakeS3Prefix(directory), opener);
 	}
 	void CreateDirectory(const string &directory, optional_ptr<FileOpener> opener = nullptr) override {
-		// DuckDB's IsRemoteFile() is hardcoded and fails to recognize fake_s3:// as such
-		// DuckLakeInsert::GetCopyOptions somehow invokes LocalFilesystem:CreateDirectoriesRecursive
-		// rather than the proper filesystem, which fails.
-		// The below instruction to create recursively seems to mitigate these issues.
+		// DuckDB's IsRemoteFile() is hardcoded and does not recognize fake_s3:// - shouldn't it call !OnDiskFile??
+		// so DuckLakeInsert::GetCopyOptions starts to create directories  were it should not..
+		// DuckLakeInsert::GetCopyOptions then invokes LocalFilesystem:CreateDirectoriesRecursive on the local FS
+		// LocalFilesystem:CreateDirectoriesRecursive then does call us here, but with fake_s3: as toplevel dir
 		if (!DiskCacheFileSystemWrapper::IsFakeS3(directory)) {
 			LocalFileSystem::CreateDirectory(directory, opener);
-		} else if (directory.length() > 10) { /* hack */
+		} else if (directory.length() > 10) { // hack to prevent DuckLakeInsert::GetCopyOptions from creating /fake_s3:
 			LocalFileSystem::CreateDirectoriesRecursive(StripFakeS3Prefix(directory), opener);
 		}
 	}
