@@ -67,8 +67,7 @@ public:
 	virtual ~DiskCacheFileSystemWrapper() = default;
 
 	static bool IsFakeS3(const string &path) {
-		auto prefix = StringUtil::Lower(path.substr(0, 7));
-		return (prefix == "fake_s3");
+		return StringUtil::Lower(path.substr(0, 8)) == "fake_s3:";
 	}
 
 protected:
@@ -313,14 +312,7 @@ public:
 
 private:
 	string StripFakeS3Prefix(const string &uri) {
-		if (!DiskCacheFileSystemWrapper::IsFakeS3(uri))
-			return uri;
-		idx_t i = 0; // Windows CI failing makes one write this code
-		while ((uri[i] != '/' && uri[i] != '\\') && (i++ < uri.size()))
-			;
-		while ((uri[i] == '/' || uri[i] == '\\') && (i++ < uri.size()))
-			;
-		return uri.substr(i);
+		return DiskCacheFileSystemWrapper::IsFakeS3(uri) ? uri.substr(10) : uri;
 	}
 };
 
