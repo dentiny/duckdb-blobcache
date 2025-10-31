@@ -274,14 +274,15 @@ public:
 		return LocalFileSystem::DirectoryExists(StripFakeS3Prefix(directory), opener);
 	}
 	void CreateDirectory(const string &directory, optional_ptr<FileOpener> opener = nullptr) override {
-		// DuckDB's IsRemoteFile() is hardcoded and fails to recognize fake_s3://
+		// DuckDB's IsRemoteFile() is hardcoded and fails to recognize fake_s3:// as such
 		// DuckLakeInsert::GetCopyOptions somehow invokes LocalFilesystem:CreateDirectoriesRecursive
 		// rather than the proper filesystem, which fails.
 		// The below instruction to create recursively seems to mitigate these issues.
-		if (DiskCacheFileSystemWrapper::IsFakeS3(directory)) {
+		if (!DiskCacheFileSystemWrapper::IsFakeS3(directory)) {
+			LocalFileSystem::CreateDirectory(directory, opener);
+		} else if (directory.length() > 10) { /* hack */
 			LocalFileSystem::CreateDirectoriesRecursive(StripFakeS3Prefix(directory), opener);
 		}
-		LocalFileSystem::CreateDirectory(directory, opener);
 	}
 	void CreateDirectoriesRecursive(const string &path, optional_ptr<FileOpener> opener = nullptr) override {
 		LocalFileSystem::CreateDirectoriesRecursive(StripFakeS3Prefix(path), opener);
